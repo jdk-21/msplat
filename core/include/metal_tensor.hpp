@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cassert>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 // CFRetain/CFRelease work on the stored buffer handle from both pure C++
@@ -102,6 +104,14 @@ public:
         size_t bytes = _numel * dtypeSize(_dtype);
         if (bytes == 0) bytes = 4;
         id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!buf) {
+            // Fail loudly: encoding a nil buffer silently corrupts downstream
+            // kernel results (observed as densify collapsing to 0 splats and
+            // a later segfault when GPU memory is exhausted).
+            throw std::runtime_error(
+                "MTensor: MTLBuffer allocation failed (" + std::to_string(bytes) +
+                " bytes) — GPU memory exhausted?");
+        }
         _buffer = (__bridge_retained void*)buf;
         _data = [buf contents];  // cache CPU-accessible pointer for C++ access
     }
