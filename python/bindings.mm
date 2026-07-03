@@ -142,28 +142,36 @@ public:
     }
 
     TrainingStats step() {
-        current_step++;
-        size_t cam_idx = next_camera();
-        Camera &cam = dataset_ptr->train_cams[cam_idx];
+        // Per-iteration autorelease pool (same fix as PR #6 for the C++ CLI).
+        // Each step creates autoreleased Metal objects (command buffers,
+        // encoders, transient textures); without draining them every
+        // iteration they accumulate for the entire run and the process is
+        // OOM-killed by macOS memory pressure. This file is compiled as
+        // Obj-C++ (.mm) so @autoreleasepool is available.
+        @autoreleasepool {
+            current_step++;
+            size_t cam_idx = next_camera();
+            Camera &cam = dataset_ptr->train_cams[cam_idx];
 
-        int ds = model->getDownscaleFactor(current_step);
-        MTensor &gt = cam.getGPUImage(ds);
+            int ds = model->getDownscaleFactor(current_step);
+            MTensor &gt = cam.getGPUImage(ds);
 
-        auto t0 = std::chrono::high_resolution_clock::now();
+            auto t0 = std::chrono::high_resolution_clock::now();
 
-        model->fullIteration(cam, current_step, gt, config.ssim_weight);
-        model->schedulersStep(current_step);
-        model->afterTrain(current_step);
-        msplat_commit();
+            model->fullIteration(cam, current_step, gt, config.ssim_weight);
+            model->schedulersStep(current_step);
+            model->afterTrain(current_step);
+            msplat_commit();
 
-        auto t1 = std::chrono::high_resolution_clock::now();
-        float ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0f;
+            auto t1 = std::chrono::high_resolution_clock::now();
+            float ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0f;
 
-        TrainingStats stats;
-        stats.iteration = current_step;
-        stats.splat_count = model->means.size(0);
-        stats.ms_per_step = ms;
-        return stats;
+            TrainingStats stats;
+            stats.iteration = current_step;
+            stats.splat_count = model->means.size(0);
+            stats.ms_per_step = ms;
+            return stats;
+        }
     }
 
     void train(nb::object callback, int callback_every) {
@@ -186,17 +194,20 @@ public:
         int n = dataset_ptr->test_cams.size();
 
         for (int i = 0; i < n; i++) {
-            Camera &cam = dataset_ptr->test_cams[i];
-            MTensor rgb = model->render(cam, config.iterations);
-            msplat_gpu_sync();
+            // Drain autoreleased Metal objects per rendered view (see step()).
+            @autoreleasepool {
+                Camera &cam = dataset_ptr->test_cams[i];
+                MTensor rgb = model->render(cam, config.iterations);
+                msplat_gpu_sync();
 
-            MTensor rgb_cpu = rgb.cpu();
-            int ds = model->getDownscaleFactor(config.iterations);
-            MTensor gt_cpu = cam.getGPUImage(ds).cpu();
+                MTensor rgb_cpu = rgb.cpu();
+                int ds = model->getDownscaleFactor(config.iterations);
+                MTensor gt_cpu = cam.getGPUImage(ds).cpu();
 
-            sum_psnr += psnr(rgb_cpu, gt_cpu);
-            sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
-            sum_l1 += l1_loss(rgb_cpu, gt_cpu);
+                sum_psnr += psnr(rgb_cpu, gt_cpu);
+                sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
+                sum_l1 += l1_loss(rgb_cpu, gt_cpu);
+            }
         }
 
         nb::dict result;

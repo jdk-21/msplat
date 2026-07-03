@@ -123,7 +123,7 @@ if(MSPLAT_BUILD_PYTHON)
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     find_package(nanobind CONFIG REQUIRED)
 
-    nanobind_add_module(_core python/bindings.cpp)
+    nanobind_add_module(_core python/bindings.mm)
     target_link_libraries(_core PRIVATE
         msplat_core
         pthread
