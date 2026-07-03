@@ -254,7 +254,11 @@ void Model::afterTrain(int step){
 
             float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
             int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
-            bool checkHuge = step > refineEvery * resetAlphaEvery;
+            // DIAGNOSIS: disabled. The hardcoded cull_scale_thresh of 0.5
+            // absolute world units (not scaled by scene extent, unlike
+            // reference 3DGS's 0.1 * scene_extent) culls legitimate large
+            // ground-plane gaussians, deleting the floor of unbounded scenes.
+            bool checkHuge = false;
             int fr_stride = (int)featuresRest_buf.stride0();
 
             int new_count = msplat_densify(
