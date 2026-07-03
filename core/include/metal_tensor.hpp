@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <cassert>
 #include <cstring>
+#include <utility>
+
+// CFRetain/CFRelease work on the stored buffer handle from both pure C++
+// (model.cpp) and Objective-C++ TUs: _buffer is a __bridge_retained
+// id<MTLBuffer>, i.e. a CFTypeRef.
+#include <CoreFoundation/CFBase.h>
 
 // Forward-declare the Metal buffer type for C++ compatibility.
 // Full Metal/Metal.h is only needed in .mm files.
@@ -33,9 +39,59 @@ inline size_t dtypeSize(DType dt) {
 }
 
 // Lightweight GPU tensor — wraps an MTLBuffer with shape metadata.
+// Shared-ownership RAII: copies and views retain the underlying MTLBuffer,
+// the destructor releases it. Without this, every reassignment (e.g. the
+// per-densification reallocation of model parameters and cached buffers)
+// leaked the previous MTLBuffer until macOS OOM-killed the process.
 class MTensor {
 public:
     MTensor() = default;
+
+    ~MTensor() {
+        if (_buffer) CFRelease(_buffer);
+    }
+
+    MTensor(const MTensor &o)
+        : _buffer(o._buffer), _data(o._data), _cpu_data(o._cpu_data),
+          _shape(o._shape), _dtype(o._dtype), _numel(o._numel) {
+        if (_buffer) CFRetain(_buffer);
+    }
+
+    MTensor &operator=(const MTensor &o) {
+        if (this == &o) return *this;
+        if (o._buffer) CFRetain(o._buffer);
+        if (_buffer) CFRelease(_buffer);
+        _buffer = o._buffer;
+        _data = o._data;
+        _cpu_data = o._cpu_data;
+        _shape = o._shape;
+        _dtype = o._dtype;
+        _numel = o._numel;
+        return *this;
+    }
+
+    MTensor(MTensor &&o) noexcept
+        : _buffer(o._buffer), _data(o._data), _cpu_data(std::move(o._cpu_data)),
+          _shape(std::move(o._shape)), _dtype(o._dtype), _numel(o._numel) {
+        o._buffer = nullptr;
+        o._data = nullptr;
+        o._numel = 0;
+    }
+
+    MTensor &operator=(MTensor &&o) noexcept {
+        if (this == &o) return *this;
+        if (_buffer) CFRelease(_buffer);
+        _buffer = o._buffer;
+        _data = o._data;
+        _cpu_data = std::move(o._cpu_data);
+        _shape = std::move(o._shape);
+        _dtype = o._dtype;
+        _numel = o._numel;
+        o._buffer = nullptr;
+        o._data = nullptr;
+        o._numel = 0;
+        return *this;
+    }
 
 #ifdef __OBJC__
     // GPU allocation (Objective-C++ only)
@@ -100,9 +156,7 @@ public:
     }
 
     void reset() {
-#ifdef __OBJC__
         if (_buffer) { CFRelease(_buffer); }
-#endif
         _buffer = nullptr;
         _data = nullptr;
         _cpu_data.clear();
@@ -119,12 +173,12 @@ public:
     }
 
     // Create a view of the first `n` elements along dim 0.
-    // WARNING: Non-owning — shares the underlying MTLBuffer without retaining it.
-    // The caller MUST ensure the parent MTensor outlives all views.
-    // Use-after-free if the parent is destroyed while a view exists.
+    // Owning: retains the shared MTLBuffer, so the view stays valid even if
+    // the parent MTensor is destroyed first.
     MTensor view(int64_t n) const {
         MTensor v;
-        v._buffer = _buffer;  // shares the buffer (non-owning)
+        v._buffer = _buffer;  // shares the buffer (retained below)
+        if (v._buffer) CFRetain(v._buffer);
         v._data = _data;      // shares the CPU-accessible pointer
         v._shape = _shape;
         v._shape[0] = n;
