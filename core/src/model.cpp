@@ -355,6 +355,35 @@ void Model::savePly(const std::string &filename, int step){
     saveGaussianPly(filename, p, step);
 }
 
+void Model::savePlyAt(const std::string &filename, int step, float time, int maxShBases){
+    // deformedMeans() returns the canonical means for a static model, so this
+    // stays correct (and time-independent) when no trajectory is trained.
+    MTensor &m = deformedMeans(time);
+    GaussianParams p{m, scales, quats, featuresDc, featuresRest, opacities,
+                     scale, {translation[0], translation[1], translation[2]}, keepCrs};
+    saveGaussianPly(filename, p, step, maxShBases);
+}
+
+void Model::savePlySequence(const std::string &dir, const std::string &prefix, int step,
+                            int numFrames, float t0, float t1, int maxShBases){
+    if (numFrames < 1)
+        throw std::runtime_error("savePlySequence: numFrames must be >= 1");
+    fs::create_directories(dir);
+
+    for (int f = 0; f < numFrames; f++) {
+        // Inclusive of both endpoints, so frame 0 is t0 and the last is t1.
+        float t = numFrames == 1 ? t0
+                                 : t0 + (t1 - t0) * (float)f / (float)(numFrames - 1);
+        std::string idx = std::to_string(f);
+        idx.insert(0, idx.size() < 4 ? 4 - idx.size() : 0, '0');
+        savePlyAt((fs::path(dir) / (prefix + "_" + idx + ".ply")).string(),
+                  step, t, maxShBases);
+    }
+    fprintf(stderr, "Saved %d frames to %s (t=%.3f..%.3f%s)\n",
+            numFrames, dir.c_str(), t0, t1,
+            maxShBases == 0 ? ", DC only" : "");
+}
+
 void Model::saveSplat(const std::string &filename){
     GaussianParams p{means, scales, quats, featuresDc, featuresRest, opacities,
                      scale, {translation[0], translation[1], translation[2]}, keepCrs};

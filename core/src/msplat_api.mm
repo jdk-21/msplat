@@ -243,6 +243,14 @@ void Trainer::exportPly(const std::string& path) {
     impl->model->savePly(path, impl->currentStep);
 }
 
+void Trainer::exportPlySequence(const std::string& dir, const std::string& prefix,
+                                int numFrames, float t0, float t1, int maxShBases) {
+    @autoreleasepool {
+        impl->model->savePlySequence(dir, prefix, impl->currentStep,
+                                     numFrames, t0, t1, maxShBases);
+    }
+}
+
 void Trainer::exportSplat(const std::string& path) {
     impl->model->saveSplat(path);
 }

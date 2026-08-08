@@ -147,6 +147,14 @@ public:
     /// Export scene to PLY format.
     void exportPly(const std::string& path);
 
+    /// Export a 4D frame sequence: numFrames PLYs sampled over the normalized
+    /// time range [t0, t1], written to dir as <prefix>_0000.ply … Feed the
+    /// folder to a viewer that plays PLY sequences.
+    /// maxShBases: -1 keeps all SH, 0 writes DC only (much smaller previews).
+    void exportPlySequence(const std::string& dir, const std::string& prefix,
+                           int numFrames, float t0 = 0.0f, float t1 = 1.0f,
+                           int maxShBases = -1);
+
     /// Export scene to .splat format.
     void exportSplat(const std::string& path);
 

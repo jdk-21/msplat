@@ -7,13 +7,15 @@
 
 static const double C0 = 0.28209479177387814;
 
-void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
+void saveGaussianPly(const std::string &path, GaussianParams &p, int step, int maxShBases) {
     msplat_gpu_sync();
 
     std::ofstream o(path, std::ios::binary);
     int64_t N = p.means.size(0);
     int numDc = (int)p.featuresDc.size(1);
-    int frBases = (int)p.featuresRest.size(-2);
+    // frBasesAll strides the source tensor; frBases is how many we write out.
+    int frBasesAll = (int)p.featuresRest.size(-2);
+    int frBases = maxShBases >= 0 ? std::min(frBasesAll, maxShBases) : frBasesAll;
     int numFr = frBases * 3;
 
     o << "ply\nformat binary_little_endian 1.0\n";
@@ -43,7 +45,7 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
         // Transpose [frBases, 3] → [3, frBases] for PLY convention
         for (int ch = 0; ch < 3; ch++)
             for (int b = 0; b < frBases; b++)
-                row[c++] = frp[i*frBases*3 + b*3 + ch];
+                row[c++] = frp[i*frBasesAll*3 + b*3 + ch];
         row[c++] = op[i];
         for (int j = 0; j < 3; j++)
             row[c++] = p.keepCrs ? std::log(std::exp(sp[i*3+j]) / p.scale) : sp[i*3+j];

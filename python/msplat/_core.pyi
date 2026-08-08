@@ -136,6 +136,18 @@ class GaussianTrainer:
         """Export the current Gaussians as a PLY file."""
         ...
 
+    def export_ply_sequence(
+        self,
+        dir: str,
+        prefix: str = "frame",
+        num_frames: int = 24,
+        t0: float = 0.0,
+        t1: float = 1.0,
+        max_sh_bases: int = -1,
+    ) -> None:
+        """Bake a 4D frame sequence of PLYs sampled over normalized time [t0, t1]."""
+        ...
+
     def export_splat(self, path: str) -> None:
         """Export the current Gaussians as a .splat file."""
         ...

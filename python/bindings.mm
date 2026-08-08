@@ -278,6 +278,16 @@ public:
         model->savePly(path, current_step);
     }
 
+    void export_ply_sequence(const std::string &dir, const std::string &prefix,
+                             int num_frames, float t0, float t1, int max_sh_bases) {
+        // Each frame dispatches a deform kernel; keep the Metal temporaries
+        // from accumulating for the whole export (same reason as step()).
+        @autoreleasepool {
+            model->savePlySequence(dir, prefix, current_step,
+                                   num_frames, t0, t1, max_sh_bases);
+        }
+    }
+
     void export_splat(const std::string &path) {
         model->saveSplat(path);
     }
@@ -429,6 +439,13 @@ NB_MODULE(_core, m) {
             "Uses intrinsics from ref_cam_idx. Returns numpy (H, W, 3) float32.")
         .def("export_ply", &GaussianTrainer::export_ply, "path"_a,
             "Export the current Gaussians as a PLY file.")
+        .def("export_ply_sequence", &GaussianTrainer::export_ply_sequence,
+            "dir"_a, "prefix"_a = "frame", "num_frames"_a = 24,
+            "t0"_a = 0.0f, "t1"_a = 1.0f, "max_sh_bases"_a = -1,
+            "Bake a 4D frame sequence: num_frames PLYs sampled over normalized time\n"
+            "[t0, t1], written to dir as <prefix>_0000.ply … Load the folder into a\n"
+            "viewer that plays PLY sequences (e.g. SuperSplat) to see the motion.\n"
+            "max_sh_bases=-1 keeps all SH; 0 writes DC only (~4x smaller).")
         .def("export_splat", &GaussianTrainer::export_splat, "path"_a,
             "Export the current Gaussians as a .splat file.")
         .def("save_checkpoint", &GaussianTrainer::save_checkpoint, "path"_a,

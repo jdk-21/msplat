@@ -48,7 +48,10 @@ struct GaussianParams {
     bool keepCrs;
 };
 
-void saveGaussianPly(const std::string &path, GaussianParams &p, int step);
+// maxShBases caps how many SH rest bases are written; -1 writes all of them.
+// 0 yields a DC-only file — same geometry and count, roughly a quarter of the
+// size, which is what a preview frame sequence wants.
+void saveGaussianPly(const std::string &path, GaussianParams &p, int step, int maxShBases = -1);
 void saveGaussianSplat(const std::string &path, GaussianParams &p);
 
 struct LoadedGaussians {

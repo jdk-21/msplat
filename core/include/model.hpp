@@ -27,6 +27,13 @@ struct Model{
   void afterTrain(int step);
   void save(const std::string &filename, int step);
   void savePly(const std::string &filename, int step);
+  // Same as savePly, but with the means evaluated at normalized `time` in
+  // [0,1]. A static model ignores the time and writes the canonical means.
+  void savePlyAt(const std::string &filename, int step, float time, int maxShBases = -1);
+  // Bakes numFrames PLYs sampled over [t0, t1] into dir as <prefix>_0000.ply …
+  // — a frame sequence any 3DGS viewer can play back as an animation.
+  void savePlySequence(const std::string &dir, const std::string &prefix, int step,
+                       int numFrames, float t0 = 0.0f, float t1 = 1.0f, int maxShBases = -1);
   void saveSplat(const std::string &filename);
   int loadPly(const std::string &filename);
   void saveCheckpoint(const std::string &filename, int step);

@@ -88,6 +88,21 @@ def main():
         white_background: bool = False
         """Composite transparent source images over white (D-NeRF protocol)"""
 
+        export_frames: int = 0
+        """4D: bake this many PLY frames across the time range (0 = off)"""
+
+        export_frames_dir: str = ""
+        """4D: directory for the frame sequence (default: <output stem>_frames)"""
+
+        export_frames_t0: float = 0.0
+        """4D: first sampled time, normalized to [0,1]"""
+
+        export_frames_t1: float = 1.0
+        """4D: last sampled time, normalized to [0,1]"""
+
+        export_frames_full_sh: bool = False
+        """4D: keep full SH in the frames (default: DC only, ~4x smaller files)"""
+
     args = tyro.cli(Args)
 
     from msplat import TrainingConfig, Dataset, GaussianTrainer, sync, cleanup
@@ -146,6 +161,30 @@ def main():
 
     trainer.export_ply(args.output)
     print(f"Saved {args.output}")
+
+    if args.export_frames > 0:
+        import os.path
+
+        if args.deform_n_poly == 0 and args.deform_n_fourier == 0:
+            print(
+                "Warning: --export-frames on a static model — all frames identical.",
+                file=sys.stderr,
+            )
+        frames_dir = args.export_frames_dir or (
+            os.path.splitext(args.output)[0] + "_frames"
+        )
+        trainer.export_ply_sequence(
+            frames_dir,
+            prefix="frame",
+            num_frames=args.export_frames,
+            t0=args.export_frames_t0,
+            t1=args.export_frames_t1,
+            max_sh_bases=-1 if args.export_frames_full_sh else 0,
+        )
+        print(
+            f"Frame sequence in {frames_dir}/ — open https://superspl.at/editor "
+            "and drop all frame_*.ply in together to play it back."
+        )
 
     if args.eval:
         metrics = trainer.evaluate()
