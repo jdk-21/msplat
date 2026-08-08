@@ -30,6 +30,17 @@ struct Config {
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
     float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
+
+    // ── 4D (Phase 2) ────────────────────────────────────────────────────────
+    // Trajectory orders for the time-varying means. Both 0 = static 3DGS,
+    // bit-for-bit the old behaviour. The defaults below are only applied when
+    // the caller opts in.
+    int deformNPoly = 0;        // polynomial order N
+    int deformNFourier = 0;     // Fourier order L
+    float deformLr = 0.001f;    // Adam lr for the trajectory coefficients
+    // Composite transparent source images over white instead of black. The
+    // published D-NeRF protocol uses white; must match bgColor to evaluate fairly.
+    bool whiteBackground = false;
 };
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -79,7 +90,7 @@ struct PixelBuffer {
 class Dataset {
 public:
     Dataset(const std::string& path, float downscaleFactor,
-            bool evalMode, int testEvery);
+            bool evalMode, int testEvery, bool whiteBackground = false);
     ~Dataset();
 
     Dataset(const Dataset&) = delete;

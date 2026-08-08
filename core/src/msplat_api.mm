@@ -24,10 +24,10 @@ struct Dataset::Impl {
 };
 
 Dataset::Dataset(const std::string& path, float downscaleFactor,
-                 bool evalMode, int testEvery)
+                 bool evalMode, int testEvery, bool whiteBackground)
     : impl(std::make_unique<Impl>())
 {
-    impl->data = inputDataFromX(path);
+    impl->data = inputDataFromX(path, "", whiteBackground);
 
     for (auto& cam : impl->data.cameras)
         cam.loadImage(downscaleFactor);
@@ -93,7 +93,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.densifyGradThresh, config.densifySizeThresh,
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs,
-        config.bgColor
+        config.bgColor,
+        config.deformNPoly, config.deformNFourier, config.deformLr
     );
 
     impl->camIndices.resize(impl->ds->trainCams.size());

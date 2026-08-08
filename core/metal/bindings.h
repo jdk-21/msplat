@@ -80,7 +80,35 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples,
+    // 4D trajectory coefficients (Phase 2). df_stride == 0 → static run; the
+    // deform_buf argument is then ignored.
+    MTensor &deform_buf, int df_stride
+);
+
+// ── 4D deformation (Phase 2) ────────────────────────────────────────────────
+// mu(t) = mu + SUM_n a_n*tau^n + SUM_l [b_l*cos(2*pi*l*tau) + c_l*sin(2*pi*l*tau)]
+// Coefficients are one (N, 3*(n_poly + 2*n_fourier)) tensor; tau is the frame
+// time recentred on the middle of the sequence.
+
+// Writes mu(t) into means_t, to be passed to msplat_train_step/msplat_render in
+// place of the canonical means.
+void msplat_deform_means_forward(
+    int num_points, MTensor &means, MTensor &deform,
+    float tau, int n_poly, int n_fourier, MTensor &means_t
+);
+
+// d L / d mu(t) from the last train step — the input to the coefficient chain rule.
+MTensor& msplat_train_v_mean3d();
+
+// Chain-rules v_mean3d onto the coefficients and applies Adam to them in one pass.
+// The canonical means need no extra work: d mu(t)/d mu = I, so their existing
+// Adam group already got the correct gradient during the train step.
+void msplat_deform_means_backward_adam(
+    int num_points, MTensor &v_mean3d, MTensor &deform,
+    MTensor &exp_avg, MTensor &exp_avg_sq,
+    float tau, int n_poly, int n_fourier,
+    float step_size, float beta1, float beta2, float bc2_sqrt, float eps
 );
 
 #endif

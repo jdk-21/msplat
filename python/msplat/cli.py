@@ -74,7 +74,19 @@ def main():
         """Evaluate on held-out test views"""
 
         test_every: int = 8
-        """Hold out every Nth image for eval"""
+        """Hold out every Nth image for eval (ignored for datasets with their own split)"""
+
+        deform_n_poly: int = 0
+        """4D: polynomial order of the per-Gaussian trajectory (0 = static 3DGS)"""
+
+        deform_n_fourier: int = 0
+        """4D: Fourier order of the per-Gaussian trajectory (0 = static 3DGS)"""
+
+        deform_lr: float = 0.001
+        """4D: Adam learning rate for the trajectory coefficients"""
+
+        white_background: bool = False
+        """Composite transparent source images over white (D-NeRF protocol)"""
 
     args = tyro.cli(Args)
 
@@ -98,13 +110,22 @@ def main():
         downscale_factor=args.downscale_factor,
         output=args.output,
         save_every=args.save_every,
+        deform_n_poly=args.deform_n_poly,
+        deform_n_fourier=args.deform_n_fourier,
+        deform_lr=args.deform_lr,
     )
+
+    # The rasterizer's background has to match what transparent source pixels
+    # were composited over, or the eval PSNR measures the mismatch.
+    if args.white_background:
+        config.bg_color = [1.0, 1.0, 1.0]
 
     dataset = Dataset(
         args.input,
         downscale_factor=args.downscale_factor,
         eval_mode=args.eval,
         test_every=args.test_every,
+        white_background=args.white_background,
     )
     print(f"Loaded {dataset.num_train} train cameras", end="")
     if args.eval:

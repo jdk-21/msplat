@@ -15,7 +15,7 @@ using json = nlohmann::json;
 // ── Image loading ───────────────────────────────────────────────────────────
 
 void Camera::loadImage(float downscaleFactor) {
-    Image raw = imreadRGB(filePath);
+    Image raw = imreadRGB(filePath, hasBgComposite ? bgComposite : nullptr);
     if (raw.empty()) return;
 
     // If actual image dimensions differ from metadata, rescale intrinsics
@@ -151,6 +151,12 @@ std::tuple<std::vector<Camera>, Camera*> InputData::getCameras(bool validate, co
 
 std::tuple<std::vector<Camera>, std::vector<Camera>> InputData::splitTrainTest(int testEvery) {
     std::vector<Camera> train, test;
+    // Datasets that ship their own split (D-NeRF) are honoured verbatim —
+    // holding out every Nth frame there would leak test poses into training.
+    if (hasExplicitSplit) {
+        for (auto &cam : cameras) (cam.isTest ? test : train).push_back(cam);
+        return {train, test};
+    }
     for (int i = 0; i < (int)cameras.size(); i++) {
         if (i % testEvery == 0)
             test.push_back(cameras[i]);
@@ -197,8 +203,14 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
 
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
-InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
+InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath,
+                         bool whiteBackground) {
     fs::path root(path);
+
+    // D-NeRF: per-split transforms with a per-frame time. Checked before
+    // Nerfstudio because some scenes ship both.
+    if (fs::exists(root / "transforms_train.json"))
+        return loaders::loadDnerf(path, whiteBackground);
 
     // Nerfstudio: transforms.json
     if (fs::exists(root / "transforms.json"))
@@ -213,5 +225,6 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
         return loaders::loadPolycam(path);
 
     throw std::runtime_error("Unrecognized dataset format in: " + path +
-        "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+        "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), "
+        "D-NeRF (transforms_train.json), Polycam (keyframes/)");
 }

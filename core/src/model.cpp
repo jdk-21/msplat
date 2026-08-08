@@ -44,8 +44,10 @@ Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs,
-    const float* bgColor)
-    : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
+    const float* bgColor,
+    int deformNPoly, int deformNFourier, float deformLr)
+    : deformNPoly(deformNPoly), deformNFourier(deformNFourier), deformLr(deformLr),
+      numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
@@ -108,6 +110,14 @@ Model::Model(const InputData &inputData, int numCameras,
         for (int64_t i = 0; i < numPoints; i++) op[i] = logit01;
     }
 
+    // 4D trajectory coefficients, all zero: mu(t) == mu at every t, so training
+    // starts from exactly the static model and only departs from it as the
+    // coefficients pick up gradient.
+    if (is4D()) {
+        deform = gpu_zeros({numPoints, (int64_t)deformStride()}, DType::Float32);
+        means_t = gpu_empty({numPoints, 3}, DType::Float32);
+    }
+
     // Background color — default is magenta (high-contrast against typical scenes,
     // makes under-reconstructed regions obvious during training)
     backgroundColor = gpu_empty({3}, DType::Float32);
@@ -134,16 +144,19 @@ void Model::setupOptimizers(){
     allocBuf(featuresDc_buf, featuresDc);
     allocBuf(featuresRest_buf, featuresRest);
     allocBuf(opacities_buf, opacities);
+    if (is4D()) allocBuf(deform_buf, deform);
 
-    static constexpr float lr_init[] = {0.00016f, 0.005f, 0.001f, 0.0025f, 0.000125f, 0.05f};
-    MTensor *params[] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities};
+    static constexpr float lr_init[] = {0.00016f, 0.005f, 0.001f, 0.0025f, 0.000125f, 0.05f, 0.0f};
+    MTensor *params[] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities, &deform};
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
+        if (!params[g]->defined()) continue;   // trajectory group on a static run
         auto shape = params[g]->shape();
         shape[0] = buf_capacity;
         adam_exp_avg_buf[g] = gpu_zeros(shape, DType::Float32);
         adam_exp_avg_sq_buf[g] = gpu_zeros(shape, DType::Float32);
         adam_lr[g] = lr_init[g];
     }
+    if (is4D()) adam_lr[6] = deformLr;
     adam_step_count = 0;
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
@@ -156,8 +169,11 @@ void Model::setupOptimizers(){
     densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
     int max_blocks = (buf_capacity + 1023) / 1024;
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+    // Scratch has to fit the widest per-gaussian buffer; with 4D enabled the
+    // trajectory stride (54 by default) overtakes featuresRest (45).
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    int64_t max_stride = std::max(fr_stride, (int64_t)deformStride());
+    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * max_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
@@ -170,6 +186,7 @@ void Model::releaseOptimizers(){
     }
     means_buf.reset(); scales_buf.reset(); quats_buf.reset();
     featuresDc_buf.reset(); featuresRest_buf.reset(); opacities_buf.reset();
+    deform_buf.reset(); means_t.reset();
     densify_split_flag.reset(); densify_dup_flag.reset();
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
@@ -188,7 +205,14 @@ void Model::refreshViews(){
     featuresDc = featuresDc_buf.view(num_active);
     featuresRest = featuresRest_buf.view(num_active);
     opacities = opacities_buf.view(num_active);
+    if (is4D()) {
+        deform = deform_buf.view(num_active);
+        // means_t is per-step scratch, not a densified buffer. refreshViews only
+        // runs on densification, so reallocating here is not on the hot path.
+        means_t = gpu_empty({(int64_t)num_active, 3}, DType::Float32);
+    }
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
+        if (!adam_exp_avg_buf[g].defined()) continue;
         adam_exp_avg[g] = adam_exp_avg_buf[g].view(num_active);
         adam_exp_avg_sq[g] = adam_exp_avg_sq_buf[g].view(num_active);
     }
@@ -208,7 +232,9 @@ void Model::ensureCapacity(int needed){
     };
     grow(means_buf); grow(scales_buf); grow(quats_buf);
     grow(featuresDc_buf); grow(featuresRest_buf); grow(opacities_buf);
+    if (is4D()) grow(deform_buf);
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
+        if (!adam_exp_avg_buf[g].defined()) continue;
         grow(adam_exp_avg_buf[g]);
         grow(adam_exp_avg_sq_buf[g]);
     }
@@ -221,7 +247,8 @@ void Model::ensureCapacity(int needed){
     int max_blocks = (new_cap + 1023) / 1024;
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
-    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
+    int64_t max_stride = std::max(fr_stride, (int64_t)deformStride());
+    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * max_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
 
     buf_capacity = new_cap;
@@ -273,7 +300,8 @@ void Model::afterTrain(int step){
                 densify_split_prefix, densify_dup_prefix,
                 densify_keep_flag, densify_keep_prefix,
                 densify_block_totals, densify_compact_scratch,
-                densify_random_samples
+                densify_random_samples,
+                deform_buf, is4D() ? deformStride() : 0
             );
 
             num_active = new_count;
@@ -392,9 +420,22 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     writeTensor(f, featuresRest);
     writeTensor(f, opacities);
 
-    // Optimizer state
-    for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
-    for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
+    // Optimizer state for the six static groups (unchanged on-disk layout)
+    for (int g = 0; g < 6; g++) writeTensor(f, adam_exp_avg[g]);
+    for (int g = 0; g < 6; g++) writeTensor(f, adam_exp_avg_sq[g]);
+
+    // 4D trajectory state, appended behind a flag so static checkpoints keep
+    // exactly the format they had before Phase 2.
+    uint32_t has4D = is4D() ? 1u : 0u;
+    f.write(reinterpret_cast<const char*>(&has4D), sizeof(has4D));
+    if (has4D) {
+        uint32_t np = (uint32_t)deformNPoly, nf = (uint32_t)deformNFourier;
+        f.write(reinterpret_cast<const char*>(&np), sizeof(np));
+        f.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+        writeTensor(f, deform);
+        writeTensor(f, adam_exp_avg[6]);
+        writeTensor(f, adam_exp_avg_sq[6]);
+    }
 
     f.close();
     std::cout << "Checkpoint saved: " << filename << " (step " << step
@@ -433,9 +474,26 @@ int Model::loadCheckpoint(const std::string &filename) {
     featuresRest = readTensor(f);
     opacities = readTensor(f);
 
-    // Optimizer state
-    for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg[g] = readTensor(f);
-    for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg_sq[g] = readTensor(f);
+    // Optimizer state for the six static groups
+    for (int g = 0; g < 6; g++) adam_exp_avg[g] = readTensor(f);
+    for (int g = 0; g < 6; g++) adam_exp_avg_sq[g] = readTensor(f);
+
+    // 4D trajectory state (see saveCheckpoint). Absent in pre-Phase-2 files,
+    // which simply end here.
+    uint32_t has4D = 0;
+    f.read(reinterpret_cast<char*>(&has4D), sizeof(has4D));
+    if (f && has4D) {
+        uint32_t np = 0, nf = 0;
+        f.read(reinterpret_cast<char*>(&np), sizeof(np));
+        f.read(reinterpret_cast<char*>(&nf), sizeof(nf));
+        deformNPoly = (int)np;
+        deformNFourier = (int)nf;
+        deform = readTensor(f);
+        adam_exp_avg[6] = readTensor(f);
+        adam_exp_avg_sq[6] = readTensor(f);
+    } else {
+        deformNPoly = deformNFourier = 0;
+    }
 
     f.close();
 
@@ -457,9 +515,11 @@ int Model::loadCheckpoint(const std::string &filename) {
     allocBuf(featuresDc_buf, featuresDc);
     allocBuf(featuresRest_buf, featuresRest);
     allocBuf(opacities_buf, opacities);
+    if (is4D()) allocBuf(deform_buf, deform);
 
     // Copy optimizer state into oversized backing buffers
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
+        if (!adam_exp_avg[g].defined()) continue;
         auto shape = adam_exp_avg[g].shape();
         shape[0] = buf_capacity;
         MTensor avg_buf = gpu_zeros(shape, DType::Float32);
@@ -537,10 +597,22 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     return s;
 }
 
+// Time is normalised to [0,1]; tau recentres it on the middle of the sequence
+// so the polynomial terms stay small and symmetric at both ends.
+static inline float deformTau(float time) { return time - 0.5f; }
+
+MTensor& Model::deformedMeans(float time) {
+    if (!is4D()) return means;
+    msplat_deform_means_forward(means.size(0), means, deform,
+                                deformTau(time), deformNPoly, deformNFourier, means_t);
+    return means_t;
+}
+
 MTensor Model::render(Camera& cam, int step){
     auto s = prepareCam(cam, step);
+    MTensor &m = deformedMeans(cam.time);
     return msplat_render(
-        means.size(0), means, scales, 1.0f,
+        means.size(0), m, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
@@ -562,11 +634,16 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     adam_step_count++;
     float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
     float bc2 = 1.0f - std::pow(adam_beta2, adam_step_count);
-    MTensor adam_p[N_ADAM_GROUPS];
-    MTensor adam_ea[N_ADAM_GROUPS], adam_eas[N_ADAM_GROUPS];
-    float adam_ss[N_ADAM_GROUPS], adam_bc2s[N_ADAM_GROUPS];
+    // Only the six static groups go through the fused train step; the
+    // trajectory group is stepped separately after the backward, because its
+    // gradient is a chain rule on v_mean3d rather than a buffer the fused
+    // kernel produces.
+    constexpr int N_FUSED_GROUPS = 6;
+    MTensor adam_p[N_FUSED_GROUPS];
+    MTensor adam_ea[N_FUSED_GROUPS], adam_eas[N_FUSED_GROUPS];
+    float adam_ss[N_FUSED_GROUPS], adam_bc2s[N_FUSED_GROUPS];
     MTensor *params[] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities};
-    for (int i = 0; i < N_ADAM_GROUPS; ++i) {
+    for (int i = 0; i < N_FUSED_GROUPS; ++i) {
         adam_p[i] = *params[i];
         adam_ea[i] = adam_exp_avg[i];
         adam_eas[i] = adam_exp_avg_sq[i];
@@ -584,18 +661,31 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
 
+    // Feed mu(t) to the projection while Adam still updates the canonical means:
+    // means3d and adam_params[0] are separate arguments, and d mu(t)/d mu = I
+    // makes the gradient the fused step computes correct for both.
+    MTensor &m = deformedMeans(cam.time);
+
     auto [r, loss] = msplat_train_step(
-        numPoints, means, scales, 1.0f,
+        numPoints, m, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
         opacities, backgroundColor, gt, window2d, ssimWeight,
         lossInvN, (int)featuresRest.size(-2),
-        N_ADAM_GROUPS,
+        N_FUSED_GROUPS,
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
         visCounts, xysGradNorm, max2DSize, invMaxDim);
+
+    if (is4D()) {
+        msplat_deform_means_backward_adam(
+            numPoints, msplat_train_v_mean3d(), deform,
+            adam_exp_avg[6], adam_exp_avg_sq[6],
+            deformTau(cam.time), deformNPoly, deformNFourier,
+            adam_lr[6] / bc1, adam_beta1, adam_beta2, std::sqrt(bc2), adam_eps);
+    }
 
     radii = r;
 }

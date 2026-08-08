@@ -24,6 +24,18 @@ struct Camera {
     float camToWorld[16] = {};  // 4x4 row-major, camera-to-world (OpenGL: Y-up, Z-back)
     std::string filePath;
 
+    // ── 4D (Phase 2) ────────────────────────────────────────────────────────
+    // Normalized timestamp in [0,1]. Static datasets leave this at 0, which
+    // makes every time-dependent term collapse to its canonical value.
+    float time = 0.0f;
+    // Set by loaders that carry their own train/test split (e.g. D-NeRF)
+    // instead of relying on the every-Nth-image rule.
+    bool isTest = false;
+    // Background to composite RGBA source images over. Synthetic datasets ship
+    // transparent PNGs; without this the alpha is dropped and holes read black.
+    bool hasBgComposite = false;
+    float bgComposite[3] = {};
+
     Image image;
     std::unordered_map<int, Image> imagePyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
@@ -48,6 +60,8 @@ struct InputData {
     float scale = 1.0f;
     float translation[3] = {};
     Points points;
+    // True when the loader already tagged cameras via Camera::isTest.
+    bool hasExplicitSplit = false;
 
     std::tuple<std::vector<Camera>, Camera*> getCameras(bool validate, const std::string &valImage = "random");
     std::tuple<std::vector<Camera>, std::vector<Camera>> splitTrainTest(int testEvery);
@@ -55,6 +69,7 @@ struct InputData {
 };
 
 // Auto-detect format and load dataset
-InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath = "");
+InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath = "",
+                         bool whiteBackground = false);
 
 #endif

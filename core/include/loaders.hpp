@@ -8,6 +8,10 @@ namespace loaders {
     InputData loadColmap(const std::string &projectRoot, const std::string &imageSourcePath = "");
     InputData loadNerfstudio(const std::string &projectRoot);
     InputData loadPolycam(const std::string &projectRoot);
+    // D-NeRF / Blender-style dynamic scenes: transforms_{train,val,test}.json
+    // with a per-frame `time`. whiteBackground picks the compositing background
+    // for the transparent PNGs (the published D-NeRF protocol uses white).
+    InputData loadDnerf(const std::string &projectRoot, bool whiteBackground);
 }
 
 // PLY point cloud reader
@@ -17,7 +21,9 @@ Points readPly(const std::string &path);
 Points readColmapPoints(const std::string &path);
 
 // Image I/O
-Image imreadRGB(const std::string &path);       // returns float32 [0,1] directly
+// Returns float32 [0,1]. bg (RGB, optional) composites source alpha over that
+// colour instead of discarding it.
+Image imreadRGB(const std::string &path, const float *bg = nullptr);
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 

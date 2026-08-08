@@ -9,7 +9,7 @@
 
 // ── Image loading (CoreGraphics) ─────────────────────────────────────────────
 
-Image imreadRGB(const std::string &path) {
+Image imreadRGB(const std::string &path, const float *bg) {
     CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
     CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
     CFRelease(cfPath);
@@ -29,12 +29,26 @@ Image imreadRGB(const std::string &path) {
     int w = (int)CGImageGetWidth(cgImage);
     int h = (int)CGImageGetHeight(cgImage);
 
-    // Render into RGBA buffer, then extract RGB and convert to float32
+    // Render into RGBA buffer, then extract RGB and convert to float32.
+    // With a background given we pre-fill it and let CoreGraphics composite the
+    // source over it, so transparent PNGs (synthetic datasets) resolve to the
+    // same background the rasterizer renders — otherwise alpha is simply dropped.
     std::vector<uint8_t> rgba(w * h * 4);
+    CGBitmapInfo alphaMode = kCGImageAlphaNoneSkipLast;
+    if (bg) {
+        alphaMode = kCGImageAlphaPremultipliedLast;
+        uint8_t fill[4] = {
+            (uint8_t)(std::clamp(bg[0], 0.0f, 1.0f) * 255.0f + 0.5f),
+            (uint8_t)(std::clamp(bg[1], 0.0f, 1.0f) * 255.0f + 0.5f),
+            (uint8_t)(std::clamp(bg[2], 0.0f, 1.0f) * 255.0f + 0.5f),
+            255
+        };
+        for (int i = 0; i < w * h; i++) memcpy(&rgba[i * 4], fill, 4);
+    }
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
         rgba.data(), w, h, 8, w * 4, colorSpace,
-        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault
+        alphaMode | kCGBitmapByteOrderDefault
     );
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
     CGContextRelease(ctx);

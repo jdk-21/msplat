@@ -14,7 +14,8 @@ struct Model{
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs,
-        const float* bgColor = nullptr);
+        const float* bgColor = nullptr,
+        int deformNPoly = 0, int deformNFourier = 0, float deformLr = 0.0f);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -47,7 +48,21 @@ struct Model{
   MTensor featuresRest;
   MTensor opacities;
 
-  static constexpr int N_ADAM_GROUPS = 6;
+  // ── 4D (Phase 2) ──────────────────────────────────────────────────────────
+  // Trajectory coefficients, (N, 3*deformBasisCount()). Empty for a static run.
+  MTensor deform;
+  int deformNPoly = 0;      // polynomial order; 0 disables the whole 4D path
+  int deformNFourier = 0;   // Fourier order
+  float deformLr = 0.0f;    // Adam lr for the trajectory group
+  bool is4D() const { return deformNPoly > 0 || deformNFourier > 0; }
+  int deformBasisCount() const { return deformNPoly + 2 * deformNFourier; }
+  int deformStride() const { return 3 * deformBasisCount(); }
+  // Evaluates mu(t) into means_t and returns it; returns the canonical means
+  // for a static model, so callers can use the result unconditionally.
+  MTensor& deformedMeans(float time);
+  MTensor means_t;          // scratch holding mu(t) for the current camera
+
+  static constexpr int N_ADAM_GROUPS = 7;  // 6 static + 1 trajectory group
   MTensor adam_exp_avg[N_ADAM_GROUPS];
   MTensor adam_exp_avg_sq[N_ADAM_GROUPS];
   int adam_step_count = 0;
@@ -56,6 +71,7 @@ struct Model{
   float means_lr_init = 0, means_lr_final = 0;
 
   MTensor means_buf, scales_buf, quats_buf, featuresDc_buf, featuresRest_buf, opacities_buf;
+  MTensor deform_buf;
   MTensor adam_exp_avg_buf[N_ADAM_GROUPS], adam_exp_avg_sq_buf[N_ADAM_GROUPS];
   int num_active = 0, buf_capacity = 0;
   void refreshViews();

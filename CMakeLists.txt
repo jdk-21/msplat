@@ -81,6 +81,7 @@ add_library(msplat_core STATIC
     core/src/input_data.cpp
     core/src/loaders/load_colmap.cpp
     core/src/loaders/load_nerfstudio.cpp
+    core/src/loaders/load_dnerf.cpp
     core/src/loaders/load_polycam.cpp
     core/src/loaders/load_ply.cpp
     core/src/loaders/image_io.cpp

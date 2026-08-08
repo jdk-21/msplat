@@ -160,6 +160,9 @@ struct MetalContext {
     id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    // 4D deformation (Phase 2)
+    id<MTLComputePipelineState> deform_means_forward_kernel_cpso;
+    id<MTLComputePipelineState> deform_means_backward_adam_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -263,6 +266,9 @@ MetalContext* init_msplat_metal_context() {
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    // 4D deformation
+    ctx->deform_means_forward_kernel_cpso         = load(@"deform_means_forward_kernel");
+    ctx->deform_means_backward_adam_kernel_cpso   = load(@"deform_means_backward_adam_kernel");
 
     [metal_library release];
 
@@ -1334,6 +1340,83 @@ std::tuple<MTensor, float> msplat_train_step(
 // Entire classify → grow → cull → compact pipeline in one compute encoder.
 // Returns new num_active after densification.
 // ============================================================================
+// 4D deformation (Phase 2)
+//
+// These bracket msplat_train_step rather than living inside it: the forward
+// writes mu(t) into a scratch tensor that is handed to the projection pass in
+// place of the canonical means, and the backward turns the v_mean3d the
+// existing backward already produces into coefficient updates. That keeps the
+// whole fused train step — and the rasterizer — untouched.
+// ============================================================================
+
+// The gradient w.r.t. the means the projection pass was given. After a train
+// step that was fed mu(t), this is d L / d mu(t) — exactly what the coefficient
+// chain rule needs.
+MTensor& msplat_train_v_mean3d() {
+    return g_tcache.v_mean3d;
+}
+
+void msplat_deform_means_forward(
+    int num_points, MTensor &means, MTensor &deform,
+    float tau, int n_poly, int n_fourier, MTensor &means_t
+) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->deform_means_forward_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                             (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->deform_means_forward_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, means, 1);
+        ENC_BUF(enc, deform, 2);
+        ENC_SCALAR(enc, tau, 3);
+        ENC_SCALAR(enc, n_poly, 4);
+        ENC_SCALAR(enc, n_fourier, 5);
+        ENC_BUF(enc, means_t, 6);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_deform_means_backward_adam(
+    int num_points, MTensor &v_mean3d, MTensor &deform,
+    MTensor &exp_avg, MTensor &exp_avg_sq,
+    float tau, int n_poly, int n_fourier,
+    float step_size, float beta1, float beta2, float bc2_sqrt, float eps
+) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->deform_means_backward_adam_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                             (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->deform_means_backward_adam_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, v_mean3d, 1);
+        ENC_BUF(enc, deform, 2);
+        ENC_BUF(enc, exp_avg, 3);
+        ENC_BUF(enc, exp_avg_sq, 4);
+        ENC_SCALAR(enc, tau, 5);
+        ENC_SCALAR(enc, n_poly, 6);
+        ENC_SCALAR(enc, n_fourier, 7);
+        ENC_SCALAR(enc, step_size, 8);
+        ENC_SCALAR(enc, beta1, 9);
+        ENC_SCALAR(enc, beta2, 10);
+        ENC_SCALAR(enc, bc2_sqrt, 11);
+        ENC_SCALAR(enc, eps, 12);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+// ============================================================================
 int msplat_densify(
     int N, int buf_capacity,
     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
@@ -1348,7 +1431,8 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples,
+    MTensor &deform_buf, int df_stride
 ) {
     MetalContext* ctx = get_global_context();
 
@@ -1361,21 +1445,30 @@ int msplat_densify(
     // Strides for each of the 18 buffers (6 params + 12 optimizer states)
     // Order: means(3), scales(3), quats(4), featuresDc(3), featuresRest(fr_stride), opacities(1)
     int strides[6] = {3, 3, 4, 3, fr_stride, 1};
-    int max_stride = fr_stride;  // featuresRest has the largest stride
+    int max_stride = std::max(fr_stride, df_stride);
 
-    // Collect all 18 buffers in order for compact loops (std::array for block capture)
-    std::array<MTensor*, 18> all_bufs = {{
+    // Collect every per-gaussian buffer for the compact loops. The 4D trajectory
+    // coefficients (+ their Adam state) ride along as a 7th group; df_stride == 0
+    // marks a static run, and those three entries are then skipped.
+    const bool has_deform = df_stride > 0;
+    std::vector<MTensor*> all_bufs = {
         &means_buf, &scales_buf, &quats_buf, &featuresDc_buf, &featuresRest_buf, &opacities_buf,
         &adam_exp_avg_buf[0], &adam_exp_avg_buf[1], &adam_exp_avg_buf[2],
         &adam_exp_avg_buf[3], &adam_exp_avg_buf[4], &adam_exp_avg_buf[5],
         &adam_exp_avg_sq_buf[0], &adam_exp_avg_sq_buf[1], &adam_exp_avg_sq_buf[2],
         &adam_exp_avg_sq_buf[3], &adam_exp_avg_sq_buf[4], &adam_exp_avg_sq_buf[5]
-    }};
-    std::array<int, 18> all_strides = {{
+    };
+    std::vector<int> all_strides = {
         3, 3, 4, 3, fr_stride, 1,
         3, 3, 4, 3, fr_stride, 1,
         3, 3, 4, 3, fr_stride, 1
-    }};
+    };
+    if (has_deform) {
+        all_bufs.push_back(&deform_buf);
+        all_bufs.push_back(&adam_exp_avg_buf[6]);
+        all_bufs.push_back(&adam_exp_avg_sq_buf[6]);
+        all_strides.insert(all_strides.end(), {df_stride, df_stride, df_stride});
+    }
 
     uint32_t N_u32 = (uint32_t)N;
     uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
@@ -1470,6 +1563,17 @@ int msplat_densify(
             ENC_BUF(enc, adam_exp_avg_sq_buf[3], 21);
             ENC_BUF(enc, adam_exp_avg_sq_buf[4], 22);
             ENC_BUF(enc, adam_exp_avg_sq_buf[5], 23);
+            // 4D coefficients. Metal requires every declared buffer to be bound,
+            // so a static run binds means_buf as a harmless stand-in and relies
+            // on df_stride == 0 to make the kernel skip it entirely.
+            int df_stride_val = df_stride;
+            MTensor &df = has_deform ? deform_buf : means_buf;
+            MTensor &df_ea = has_deform ? adam_exp_avg_buf[6] : means_buf;
+            MTensor &df_es = has_deform ? adam_exp_avg_sq_buf[6] : means_buf;
+            ENC_BUF(enc, df, 24);
+            ENC_SCALAR(enc, df_stride_val, 25);
+            ENC_BUF(enc, df_ea, 26);
+            ENC_BUF(enc, df_es, 27);
             [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1502,6 +1606,14 @@ int msplat_densify(
             ENC_BUF(enc, adam_exp_avg_sq_buf[3], 20);
             ENC_BUF(enc, adam_exp_avg_sq_buf[4], 21);
             ENC_BUF(enc, adam_exp_avg_sq_buf[5], 22);
+            int df_stride_val = df_stride;
+            MTensor &df = has_deform ? deform_buf : means_buf;
+            MTensor &df_ea = has_deform ? adam_exp_avg_buf[6] : means_buf;
+            MTensor &df_es = has_deform ? adam_exp_avg_sq_buf[6] : means_buf;
+            ENC_BUF(enc, df, 23);
+            ENC_SCALAR(enc, df_stride_val, 24);
+            ENC_BUF(enc, df_ea, 25);
+            ENC_BUF(enc, df_es, 26);
             [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1550,10 +1662,10 @@ int msplat_densify(
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Stage 8: Compact scatter (18 buffers → scratch) ----
+        // ---- Stage 8: Compact scatter (all per-gaussian buffers → scratch) ----
         // For each buffer: scatter kept elements into compact_scratch
         // Then copy back. We reuse compact_scratch at different offsets per stride.
-        for (int b = 0; b < 18; b++) {
+        for (int b = 0; b < (int)all_bufs.size(); b++) {
             uint32_t wc = (uint32_t)worst_case;
             uint32_t stride_u32 = (uint32_t)all_strides[b];
             uint32_t total_threads = wc * stride_u32;

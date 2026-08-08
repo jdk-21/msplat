@@ -1688,6 +1688,127 @@ kernel void fused_adam_kernel(
     exp_avg_sq[tid] = v;
 }
 
+// ============================================================================
+// 4D deformation (Phase 2) — time-varying means
+//
+// Each gaussian carries, on top of its canonical mean, a set of trajectory
+// coefficients. The mean at time t is
+//
+//   mu(t) = mu + SUM_n a_n * tau^n  +  SUM_l [ b_l*cos(2*pi*l*tau) + c_l*sin(2*pi*l*tau) ]
+//
+// with tau = t - 0.5 (times are normalised to [0,1], so tau is centred on the
+// middle of the sequence). The polynomial part carries non-periodic drift, the
+// Fourier part carries oscillation; l=1 has exactly the period of the sequence.
+//
+// Coefficients live in one (N, 3*B) tensor, B = n_poly + 2*n_fourier basis
+// functions, laid out as B consecutive float3 blocks per gaussian. Keeping them
+// in a single tensor means densification only has to carry one extra buffer.
+//
+// With all coefficients zero, mu(t) == mu for every t, so a freshly initialised
+// 4D model is bit-identical to the static one — that is the regression test.
+// ============================================================================
+
+// Adam update helper — applies one Adam step to a single element.
+// Computes in registers, writes param/exp_avg/exp_avg_sq back to device memory.
+inline void adam_update_element(
+    device float& param, device float& ea, device float& eas,
+    float grad, float step_size, float beta1, float beta2, float bc2_sqrt, float eps
+) {
+    float m = fma(beta1, ea, (1.0f - beta1) * grad);
+    float v = fma(beta2, eas, (1.0f - beta2) * grad * grad);
+    param -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
+    ea = m;
+    eas = v;
+}
+
+constant constexpr int MAX_DEFORM_BASIS = 64;
+
+// Evaluates the trajectory basis at tau. Returns the number of basis functions.
+inline int eval_deform_basis(float tau, int n_poly, int n_fourier,
+                             thread float *basis) {
+    int b = 0;
+    float tp = 1.0f;
+    for (int n = 0; n < n_poly; n++) {
+        tp *= tau;                      // tau^1 .. tau^n_poly
+        basis[b++] = tp;
+    }
+    for (int l = 1; l <= n_fourier; l++) {
+        float a = 2.0f * M_PI_F * (float)l * tau;
+        basis[b++] = cos(a);
+        basis[b++] = sin(a);
+    }
+    return b;
+}
+
+// mu(t) for every gaussian, written to a scratch buffer that is then fed to the
+// projection pass in place of the canonical means.
+kernel void deform_means_forward_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* means           [[buffer(1)]],
+    constant float* deform          [[buffer(2)]],
+    constant float& tau             [[buffer(3)]],
+    constant int& n_poly            [[buffer(4)]],
+    constant int& n_fourier         [[buffer(5)]],
+    device float* means_t           [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+
+    float basis[MAX_DEFORM_BASIS];
+    int B = eval_deform_basis(tau, n_poly, n_fourier, basis);
+
+    uint base = idx * (uint)(3 * B);
+    float3 d = float3(0.0f);
+    for (int b = 0; b < B; b++) {
+        uint o = base + (uint)(3 * b);
+        d += basis[b] * float3(deform[o], deform[o + 1], deform[o + 2]);
+    }
+
+    means_t[idx * 3 + 0] = means[idx * 3 + 0] + d.x;
+    means_t[idx * 3 + 1] = means[idx * 3 + 1] + d.y;
+    means_t[idx * 3 + 2] = means[idx * 3 + 2] + d.z;
+}
+
+// Backward + Adam in one pass. d mu(t)/d a_b = basis_b * I, so the gradient of a
+// coefficient block is just v_mean3d scaled by its basis value — cheap enough to
+// recompute here rather than materialise an (N, 3*B) gradient buffer.
+// The canonical mean needs no special handling: d mu(t)/d mu = I, so the
+// existing Adam group already receives the right gradient.
+kernel void deform_means_backward_adam_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* v_mean3d        [[buffer(1)]],
+    device float* deform            [[buffer(2)]],
+    device float* exp_avg           [[buffer(3)]],
+    device float* exp_avg_sq        [[buffer(4)]],
+    constant float& tau             [[buffer(5)]],
+    constant int& n_poly            [[buffer(6)]],
+    constant int& n_fourier         [[buffer(7)]],
+    constant float& step_size       [[buffer(8)]],
+    constant float& beta1           [[buffer(9)]],
+    constant float& beta2           [[buffer(10)]],
+    constant float& bc2_sqrt        [[buffer(11)]],
+    constant float& eps             [[buffer(12)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+
+    float basis[MAX_DEFORM_BASIS];
+    int B = eval_deform_basis(tau, n_poly, n_fourier, basis);
+
+    float3 vg = float3(v_mean3d[idx * 3], v_mean3d[idx * 3 + 1], v_mean3d[idx * 3 + 2]);
+    uint base = idx * (uint)(3 * B);
+    for (int b = 0; b < B; b++) {
+        uint o = base + (uint)(3 * b);
+        float3 g = basis[b] * vg;
+        adam_update_element(deform[o + 0], exp_avg[o + 0], exp_avg_sq[o + 0],
+                            g.x, step_size, beta1, beta2, bc2_sqrt, eps);
+        adam_update_element(deform[o + 1], exp_avg[o + 1], exp_avg_sq[o + 1],
+                            g.y, step_size, beta1, beta2, bc2_sqrt, eps);
+        adam_update_element(deform[o + 2], exp_avg[o + 2], exp_avg_sq[o + 2],
+                            g.z, step_size, beta1, beta2, bc2_sqrt, eps);
+    }
+}
+
 // ===== Fused Projection + SH Kernels =====
 // Combines project_gaussians_forward_kernel + compute_sh_forward_kernel into one dispatch.
 // Saves 1 kernel dispatch + 1 read of means3d per direction. Skips SH for culled gaussians.
@@ -1784,19 +1905,6 @@ kernel void project_and_sh_forward_kernel(
     uint rest_idx = (num_bases - 1) * num_channels * idx;
     uint idx_col = num_channels * idx;
     sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
-}
-
-// Adam update helper — applies one Adam step to a single element.
-// Computes in registers, writes param/exp_avg/exp_avg_sq back to device memory.
-inline void adam_update_element(
-    device float& param, device float& ea, device float& eas,
-    float grad, float step_size, float beta1, float beta2, float bc2_sqrt, float eps
-) {
-    float m = fma(beta1, ea, (1.0f - beta1) * grad);
-    float v = fma(beta2, eas, (1.0f - beta2) * grad * grad);
-    param -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
-    ea = m;
-    eas = v;
 }
 
 // Packed Adam hyperparameters for SH groups (passed via setBytes)
@@ -3536,6 +3644,12 @@ kernel void densify_append_split_kernel(
     device float* adam_es3           [[buffer(21)]],
     device float* adam_es4           [[buffer(22)]],
     device float* adam_es5           [[buffer(23)]],
+    // 4D trajectory coefficients (Phase 2). df_stride == 0 disables them, which
+    // is how a static run keeps the old behaviour with dummy buffers bound.
+    device float* deform_buf         [[buffer(24)]],
+    constant int& df_stride          [[buffer(25)]],
+    device float* adam_ea6           [[buffer(26)]],
+    device float* adam_es6           [[buffer(27)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N || split_flag[idx] == 0) return;
@@ -3591,6 +3705,13 @@ kernel void densify_append_split_kernel(
         for (int j = 0; j < 3; j++) { adam_ea3[child*3+j] = 0; adam_es3[child*3+j] = 0; }
         for (int j = 0; j < fr_stride; j++) { adam_ea4[child*fr_stride+j] = 0; adam_es4[child*fr_stride+j] = 0; }
         adam_ea5[child] = 0; adam_es5[child] = 0;
+
+        // Children inherit the parent's trajectory, so a split gaussian keeps
+        // moving the way its parent did instead of snapping back to static.
+        for (int j = 0; j < df_stride; j++) {
+            deform_buf[child*df_stride+j] = deform_buf[idx*df_stride+j];
+            adam_ea6[child*df_stride+j] = 0; adam_es6[child*df_stride+j] = 0;
+        }
     }
 
     // Shrink parent scale in-place
@@ -3625,6 +3746,11 @@ kernel void densify_append_dup_kernel(
     device float* adam_es3           [[buffer(20)]],
     device float* adam_es4           [[buffer(21)]],
     device float* adam_es5           [[buffer(22)]],
+    // 4D trajectory coefficients (Phase 2); df_stride == 0 disables them.
+    device float* deform_buf         [[buffer(23)]],
+    constant int& df_stride          [[buffer(24)]],
+    device float* adam_ea6           [[buffer(25)]],
+    device float* adam_es6           [[buffer(26)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N || dup_flag[idx] == 0) return;
@@ -3648,6 +3774,12 @@ kernel void densify_append_dup_kernel(
     for (int j = 0; j < 3; j++) { adam_ea3[dst*3+j] = 0; adam_es3[dst*3+j] = 0; }
     for (int j = 0; j < fr_stride; j++) { adam_ea4[dst*fr_stride+j] = 0; adam_es4[dst*fr_stride+j] = 0; }
     adam_ea5[dst] = 0; adam_es5[dst] = 0;
+
+    // Duplicates inherit the parent trajectory (see split kernel).
+    for (int j = 0; j < df_stride; j++) {
+        deform_buf[dst*df_stride+j] = deform_buf[idx*df_stride+j];
+        adam_ea6[dst*df_stride+j] = 0; adam_es6[dst*df_stride+j] = 0;
+    }
 }
 
 // Classify each post-growth gaussian as keep or cull.

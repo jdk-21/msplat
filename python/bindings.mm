@@ -43,6 +43,10 @@ struct TrainingConfig {
     // Magenta default — high contrast against typical scenes, makes
     // under-reconstructed regions obvious during training.
     std::vector<float> bg_color = {0.6130f, 0.0101f, 0.3984f};
+    // 4D (Phase 2): both 0 = static 3DGS.
+    int deform_n_poly = 0;
+    int deform_n_fourier = 0;
+    float deform_lr = 0.001f;
 };
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
@@ -62,9 +66,9 @@ public:
     std::vector<Camera> test_cams;
 
     Dataset(const std::string &path, float downscale_factor,
-            bool eval_mode, int test_every)
+            bool eval_mode, int test_every, bool white_background)
     {
-        data = inputDataFromX(path);
+        data = inputDataFromX(path, "", white_background);
 
         // Load images (parallel)
         for (auto &cam : data.cameras) {
@@ -122,7 +126,8 @@ public:
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
             cfg.stop_screen_size_at, cfg.split_screen_size,
             cfg.iterations, cfg.keep_crs,
-            cfg.bg_color.data()
+            cfg.bg_color.data(),
+            cfg.deform_n_poly, cfg.deform_n_fourier, cfg.deform_lr
         );
 
         cam_indices.resize(dataset.train_cams.size());
@@ -306,7 +311,8 @@ NB_MODULE(_core, m) {
                 int stop_screen_size_at, float split_screen_size,
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
-                std::vector<float> bg_color) {
+                std::vector<float> bg_color,
+                int deform_n_poly, int deform_n_fourier, float deform_lr) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -328,6 +334,9 @@ NB_MODULE(_core, m) {
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
+            cfg->deform_n_poly = deform_n_poly;
+            cfg->deform_n_fourier = deform_n_fourier;
+            cfg->deform_lr = deform_lr;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -346,7 +355,13 @@ NB_MODULE(_core, m) {
             "downscale_factor"_a = 1.0f,
             "output"_a = "splat.ply",
             "save_every"_a = -1,
-            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f})
+            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
+            "deform_n_poly"_a = 0,
+            "deform_n_fourier"_a = 0,
+            "deform_lr"_a = 0.001f)
+        .def_rw("deform_n_poly", &TrainingConfig::deform_n_poly)
+        .def_rw("deform_n_fourier", &TrainingConfig::deform_n_fourier)
+        .def_rw("deform_lr", &TrainingConfig::deform_lr)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -381,10 +396,12 @@ NB_MODULE(_core, m) {
 
     // Dataset
     nb::class_<Dataset>(m, "Dataset",
-            "A loaded dataset of camera images. Auto-detects COLMAP, Nerfstudio, and Polycam formats.")
-        .def(nb::init<const std::string &, float, bool, int>(),
+            "A loaded dataset of camera images. Auto-detects COLMAP, Nerfstudio, "
+            "D-NeRF, and Polycam formats.")
+        .def(nb::init<const std::string &, float, bool, int, bool>(),
             "path"_a, "downscale_factor"_a = 1.0f,
-            "eval_mode"_a = false, "test_every"_a = 8)
+            "eval_mode"_a = false, "test_every"_a = 8,
+            "white_background"_a = false)
         .def_prop_ro("num_train", &Dataset::num_train, "Number of training cameras.")
         .def_prop_ro("num_test", &Dataset::num_test, "Number of test cameras (0 unless eval_mode=True).")
         .def("camera_pose", &Dataset::camera_pose, "index"_a,
