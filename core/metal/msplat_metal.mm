@@ -492,13 +492,14 @@ static void forward_pipeline(
         && (num_points_changed || (iter_count_oc % 100) == 1)) {
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
+        if (flag_val & 1) {
             fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
                     "Some gaussians were dropped from overfull tiles.\n");
             overflow_warned = true;
         }
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    capacity = std::min(capacity, (int64_t)num_tiles * 2048);  // bins can't emit more
     uint32_t channels = 3;
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
@@ -613,6 +614,8 @@ static void forward_pipeline(
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
             ENC_BUF(enc, tile_bins, 12);
+            ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -807,18 +810,55 @@ std::tuple<MTensor, float> msplat_train_step(
         && (num_points_changed || (iter_count_oc % 100) == 1)) {
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
+        if (flag_val & 1) {
             fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
                     "Some gaussians were dropped from overfull tiles.\n");
             overflow_warned = true;
         }
     }
+    // Adaptive packed-buffer capacity: if the last completed step's tile prefix
+    // total exceeded the packed capacity, the sort kernel clamped and dropped
+    // the overflow. Grow the multiplier so the next allocation fits everything.
+    // The read is unsynced shared memory — worst case the value is stale and
+    // the growth happens a step later, which the clamp makes safe.
+    if (g_tcache.tile_offsets.defined() && g_tcache.num_tiles > 0 && g_tcache.fwd_num_points > 0) {
+        int64_t prev_total = (int64_t)g_tcache.tile_offsets.data<int>()[g_tcache.num_tiles - 1];
+        int64_t prev_cap = (int64_t)g_tcache.fwd_num_points * g_tcache.capacity_multiplier;
+        // The physical maximum: every tile bin full. Readings above it are
+        // garbage (uninitialised buffer or a torn mid-write read) — ignore them.
+        int64_t prev_max = (int64_t)g_tcache.num_tiles * 2048;  // MAX_TILE_ELEMS
+        if (prev_total > prev_cap && prev_total <= prev_max) {
+            int64_t needed = (3 * prev_total / 2) / g_tcache.fwd_num_points + 1;
+            g_tcache.capacity_multiplier = std::max(g_tcache.capacity_multiplier, needed);
+            fprintf(stderr, "msplat: packed-buffer capacity exceeded (%lld > %lld), "
+                    "growing multiplier to %lld\n",
+                    (long long)prev_total, (long long)prev_cap,
+                    (long long)g_tcache.capacity_multiplier);
+        }
+    }
+
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    // More capacity than the bins can ever emit is wasted memory.
+    capacity = std::min(capacity, (int64_t)num_tiles * 2048);
     uint32_t channels = 3;
 
     // --- Cached buffer pool ---
     g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
     g_tcache.ensure_backward(num_points, features_rest_bases, ctx->device);
+
+    if (std::getenv("MSPLAT_DEBUG_NAN")) {
+        msplat_gpu_sync();
+        const float *sc = scales.data<float>();
+        const float *qu = quats.data<float>();
+        int64_t zs = 0, zq = 0;
+        for (int64_t i = 0; i < num_points; i++) {
+            if (sc[3*i] == 0 && sc[3*i+1] == 0 && sc[3*i+2] == 0) zs++;
+            if (qu[4*i] == 0 && qu[4*i+1] == 0 && qu[4*i+2] == 0 && qu[4*i+3] == 0) zq++;
+        }
+        fprintf(stderr, "  [entry] scale0=%g,%g,%g quat0=%g,%g,%g,%g zero_scales=%lld zero_quats=%lld\n",
+                sc[0], sc[1], sc[2], qu[0], qu[1], qu[2], qu[3],
+                (long long)zs, (long long)zq);
+    }
 
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
@@ -956,6 +996,8 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
             ENC_BUF(enc, tile_bins, 12);
+            ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -1332,6 +1374,71 @@ std::tuple<MTensor, float> msplat_train_step(
     }
 
     float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
+
+    // MSPLAT_DEBUG_NAN=1: scan each pipeline stage's output for nonfinite values
+    // to localise where a NaN first enters (forward → loss → rast bwd → proj bwd).
+    if (std::getenv("MSPLAT_DEBUG_NAN")) {
+        msplat_gpu_sync();
+        // Dump every input of the projection backward for the first NaN point,
+        // so the vjp can be recomputed on the CPU.
+        {
+            const float *vm3 = v_mean3d.data<float>();
+            int64_t bad_idx = -1;
+            for (int64_t i = 0; i < num_points; i++)
+                if (!std::isfinite(vm3[3*i]) || !std::isfinite(vm3[3*i+1]) || !std::isfinite(vm3[3*i+2])) { bad_idx = i; break; }
+            if (bad_idx >= 0) {
+                int64_t i = bad_idx;
+                const float *me = means3d.data<float>();
+                const float *sc = scales.data<float>();
+                const float *qu = quats.data<float>();
+                const float *co = conics.data<float>();
+                const float *vc = v_conic.data<float>();
+                const float *vx = v_xy.data<float>();
+                const float *vd = v_depth.data<float>();
+                const float *vmt = viewmat.data<float>();
+                const int *ra = radii_out.data<int>();
+                fprintf(stderr, "  [debug_nan] first NaN idx=%lld radii=%d\n", (long long)i, ra[i]);
+                fprintf(stderr, "    mean=%g,%g,%g scale=%g,%g,%g quat=%g,%g,%g,%g\n",
+                        me[3*i],me[3*i+1],me[3*i+2], sc[3*i],sc[3*i+1],sc[3*i+2],
+                        qu[4*i],qu[4*i+1],qu[4*i+2],qu[4*i+3]);
+                fprintf(stderr, "    conic=%g,%g,%g v_conic=%g,%g,%g v_xy=%g,%g v_depth=%g\n",
+                        co[3*i],co[3*i+1],co[3*i+2], vc[3*i],vc[3*i+1],vc[3*i+2],
+                        vx[2*i],vx[2*i+1], vd[i]);
+                fprintf(stderr, "    v_mean3d=%g,%g,%g fx=%g fy=%g img=%ux%u\n",
+                        vm3[3*i],vm3[3*i+1],vm3[3*i+2], fx, fy, img_width, img_height);
+                fprintf(stderr, "    viewmat=[%g %g %g %g; %g %g %g %g; %g %g %g %g]\n",
+                        vmt[0],vmt[1],vmt[2],vmt[3], vmt[4],vmt[5],vmt[6],vmt[7],
+                        vmt[8],vmt[9],vmt[10],vmt[11]);
+            }
+        }
+        auto scan = [](const char *name, MTensor &t) {
+            if (!t.defined() || t.numel() == 0) return;
+            const float *p = t.data<float>();
+            int64_t bad = 0; double mx = 0;
+            for (int64_t i = 0; i < t.numel(); i++) {
+                if (!std::isfinite(p[i])) bad++;
+                else mx = std::max(mx, (double)std::abs(p[i]));
+            }
+            fprintf(stderr, "    %-14s nonfinite=%-8lld max|x|=%g\n", name, (long long)bad, mx);
+        };
+        {
+            const int *off = g_tcache.tile_offsets.data<int>();
+            fprintf(stderr, "  [debug_nan] loss=%g total_tile_elems=%d capacity=%lld\n",
+                    loss_val, off[num_tiles - 1], (long long)capacity);
+        }
+        scan("colors", g_tcache.colors);
+        scan("conics", g_tcache.conics);
+        scan("xys", g_tcache.xys);
+        scan("out_img", g_tcache.out_img);
+        scan("v_rendered", g_tcache.v_rendered);
+        scan("v_colors_rast", g_tcache.v_colors_rast);
+        scan("v_opacity", g_tcache.v_opacity);
+        scan("v_xy", g_tcache.v_xy);
+        scan("v_conic", g_tcache.v_conic);
+        scan("v_mean3d", g_tcache.v_mean3d);
+        scan("v_scale", g_tcache.v_scale);
+        scan("v_quat", g_tcache.v_quat);
+    }
     return std::make_tuple(radii_out, loss_val);
 }
 

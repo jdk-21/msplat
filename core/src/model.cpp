@@ -58,6 +58,17 @@ Model::Model(const InputData &inputData, int numCameras,
     scale = inputData.scale;
     memcpy(translation, inputData.translation, sizeof(translation));
 
+    // Camera extent in the normalised frame (cameras are centered and scaled
+    // by autoScaleAndCenter before the model is built).
+    {
+        float maxDist = 0.0f;
+        for (const auto &cam : inputData.cameras) {
+            float x = cam.camToWorld[3], y = cam.camToWorld[7], z = cam.camToWorld[11];
+            maxDist = std::max(maxDist, std::sqrt(x*x + y*y + z*z));
+        }
+        if (maxDist > 0.0f) sceneExtent = 1.1f * maxDist;
+    }
+
     // Means: copy xyz directly to GPU
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
@@ -281,17 +292,19 @@ void Model::afterTrain(int step){
 
             float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
             int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
-            // DIAGNOSIS: disabled. The hardcoded cull_scale_thresh of 0.5
-            // absolute world units (not scaled by scene extent, unlike
-            // reference 3DGS's 0.1 * scene_extent) culls legitimate large
-            // ground-plane gaussians, deleting the floor of unbounded scenes.
-            bool checkHuge = false;
+            // Huge-gaussian cull, threshold scaled by scene extent as in
+            // reference 3DGS (0.1 * cameras_extent). The previous absolute
+            // 0.5-unit threshold deleted the legitimate large ground-plane
+            // gaussians of unbounded scenes; gating stays at the first
+            // opacity reset like splatfacto.
+            bool checkHuge = step > refineEvery * resetAlphaEvery;
+            float cullScaleThresh = 0.1f * sceneExtent;
             int fr_stride = (int)featuresRest_buf.stride0();
 
             int new_count = msplat_densify(
                 num_active, buf_capacity,
                 densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
-                0.1f, 0.5f, 0.15f, checkHuge ? 1 : 0,
+                0.1f, cullScaleThresh, 0.15f, checkHuge ? 1 : 0,
                 xysGradNorm, visCounts, max2DSize, half_max_dim,
                 means_buf, scales_buf, quats_buf,
                 featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,

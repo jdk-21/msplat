@@ -2158,7 +2158,7 @@ kernel void scatter_to_prealloc_bins_kernel(
             if (pos >= MAX_TILE_ELEMS) {
                 // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
                 atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
-                atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
+                atomic_fetch_or_explicit(overflow_flag, 1u, memory_order_relaxed);
                 continue;
             }
             prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
@@ -2184,6 +2184,8 @@ kernel void bitonic_sort_per_tile_kernel(
     device float* packed_conic          [[buffer(10)]],
     device float* packed_rgb            [[buffer(11)]],
     device int* tile_bins               [[buffer(12)]],
+    constant uint& out_capacity         [[buffer(13)]],
+    device atomic_uint* overflow_flag   [[buffer(14)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
@@ -2194,12 +2196,25 @@ kernel void bitonic_sort_per_tile_kernel(
     int end = tile_offsets[tg_id];
     int start = end - count;
 
+    // Clamp to the packed-output capacity. The prefix-sum total can exceed it
+    // (e.g. freshly initialised random clouds where every gaussian covers a
+    // large screen area); without the clamp the pack loop below writes far past
+    // gaussian_ids/packed_* and corrupts unrelated buffers. Clamped tiles drop
+    // their overflow; the host reads tile_offsets[num_tiles-1] and grows the
+    // buffers for the next step.
+    if (end > (int)out_capacity) {
+        if (tid == 0) atomic_fetch_or_explicit(overflow_flag, 2u, memory_order_relaxed);
+        end = min(end, (int)out_capacity);
+        start = min(start, (int)out_capacity);
+        count = end - start;
+    }
+
     // Write tile_bins for rasterizer
     if (tid == 0) {
         write_packed_int2(tile_bins, tg_id, int2(start, end));
     }
 
-    if (count == 0) return;
+    if (count <= 0) return;
 
     // Round up to next power of 2
     int n = 1;

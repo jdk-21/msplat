@@ -113,6 +113,10 @@ struct Model{
 
   float scale;
   float translation[3] = {};
+  // 1.1 * max camera distance from the (already centered) origin — the same
+  // convention as reference 3DGS's cameras_extent. Used to scale the
+  // huge-gaussian cull threshold.
+  float sceneExtent = 1.0f;
 };
 
 #endif
