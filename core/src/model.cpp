@@ -688,4 +688,19 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     }
 
     radii = r;
+
+    // MSPLAT_DEBUG_MEANS=1 syncs and scans the means every step — expensive, but
+    // it is what localised the SH NaN: a healthy run keeps max|means| at the
+    // scene extent, a broken one collapses to +-lr or goes NaN on the first step.
+    if (std::getenv("MSPLAT_DEBUG_MEANS")) {
+        msplat_gpu_sync();
+        const float *a = means.data<float>();
+        double mx = 0; int64_t n = means.numel(); int64_t nbad = 0;
+        for (int64_t i = 0; i < n; i++) {
+            mx = std::max(mx, (double)std::abs(a[i]));
+            if (!std::isfinite(a[i])) nbad++;
+        }
+        fprintf(stderr, "step=%d 4d=%d N=%lld means[0..2]=%g,%g,%g max|means|=%g nonfinite=%lld\n",
+                step, (int)is4D(), (long long)means.size(0), a[0], a[1], a[2], mx, (long long)nbad);
+    }
 }

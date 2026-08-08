@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <random>
 #include <cmath>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -29,7 +30,23 @@ static constexpr int DNERF_NOMINAL_RES = 800;
 // units. The synthetic objects all sit inside roughly [-1.3, 1.3]^3 with the
 // cameras orbiting at radius ~4.
 static constexpr float INIT_CUBE_HALF_EXTENT = 1.3f;
-static constexpr int64_t INIT_NUM_POINTS = 100000;
+
+// The published dynamic-Gaussian baselines seed 100k random points here, but
+// msplat's rasterizer sorts at most MAX_TILE_ELEMS = 2048 gaussians per 16x16
+// tile in threadgroup memory. A dense random cube projects onto very few tiles,
+// so 100k points overflow that limit catastrophically on the very first step —
+// and the overflow does not merely drop splats, it corrupts the parameter
+// buffers (means come back zeroed or NaN). Keep the default under the limit;
+// MSPLAT_DNERF_INIT_POINTS raises it for experiments.
+static constexpr int64_t INIT_NUM_POINTS = 20000;
+
+static int64_t initNumPoints() {
+    if (const char *e = std::getenv("MSPLAT_DNERF_INIT_POINTS")) {
+        long long v = atoll(e);
+        if (v > 0) return (int64_t)v;
+    }
+    return INIT_NUM_POINTS;
+}
 
 static void loadSplit(const std::string &projectRoot, const std::string &file,
                       bool isTest, bool whiteBackground, InputData &data) {
@@ -83,10 +100,11 @@ InputData loaders::loadDnerf(const std::string &projectRoot, bool whiteBackgroun
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> pos(-INIT_CUBE_HALF_EXTENT, INIT_CUBE_HALF_EXTENT);
     std::uniform_int_distribution<int> col(0, 255);
-    data.points.count = INIT_NUM_POINTS;
-    data.points.xyz.resize(INIT_NUM_POINTS * 3);
-    data.points.rgb.resize(INIT_NUM_POINTS * 3);
-    for (int64_t i = 0; i < INIT_NUM_POINTS * 3; i++) {
+    const int64_t nPts = initNumPoints();
+    data.points.count = nPts;
+    data.points.xyz.resize(nPts * 3);
+    data.points.rgb.resize(nPts * 3);
+    for (int64_t i = 0; i < nPts * 3; i++) {
         data.points.xyz[i] = pos(rng);
         data.points.rgb[i] = (uint8_t)col(rng);
     }
