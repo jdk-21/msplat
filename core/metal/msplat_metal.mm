@@ -161,8 +161,17 @@ struct MetalContext {
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
     // 4D deformation (Phase 2)
-    id<MTLComputePipelineState> deform_means_forward_kernel_cpso;
-    id<MTLComputePipelineState> deform_means_backward_adam_kernel_cpso;
+    id<MTLComputePipelineState> deform_forward_kernel_cpso;
+    id<MTLComputePipelineState> deform_backward_adam_kernel_cpso;
+    // Flow splatting (Phase 3)
+    id<MTLComputePipelineState> velocity_field_kernel_cpso;
+    id<MTLComputePipelineState> flow_project_kernel_cpso;
+    id<MTLComputePipelineState> pack_flow_kernel_cpso;
+    id<MTLComputePipelineState> flow_rasterize_forward_kernel_cpso;
+    id<MTLComputePipelineState> flow_loss_kernel_cpso;
+    id<MTLComputePipelineState> flow_rasterize_backward_kernel_cpso;
+    id<MTLComputePipelineState> flow_project_backward_kernel_cpso;
+    id<MTLComputePipelineState> rigid_loss_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -267,8 +276,17 @@ MetalContext* init_msplat_metal_context() {
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
     // 4D deformation
-    ctx->deform_means_forward_kernel_cpso         = load(@"deform_means_forward_kernel");
-    ctx->deform_means_backward_adam_kernel_cpso   = load(@"deform_means_backward_adam_kernel");
+    ctx->deform_forward_kernel_cpso               = load(@"deform_forward_kernel");
+    ctx->deform_backward_adam_kernel_cpso         = load(@"deform_backward_adam_kernel");
+    // Flow splatting
+    ctx->velocity_field_kernel_cpso               = load(@"velocity_field_kernel");
+    ctx->flow_project_kernel_cpso                 = load(@"flow_project_kernel");
+    ctx->pack_flow_kernel_cpso                    = load(@"pack_flow_kernel");
+    ctx->flow_rasterize_forward_kernel_cpso       = load(@"flow_rasterize_forward_kernel");
+    ctx->flow_loss_kernel_cpso                    = load(@"flow_loss_kernel");
+    ctx->flow_rasterize_backward_kernel_cpso      = load(@"flow_rasterize_backward_kernel");
+    ctx->flow_project_backward_kernel_cpso        = load(@"flow_project_backward_kernel");
+    ctx->rigid_loss_kernel_cpso                   = load(@"rigid_loss_kernel");
 
     [metal_library release];
 
@@ -297,6 +315,8 @@ MetalContext* get_global_context() {
 
 #define ENC_SCALAR(encoder, x, i) [encoder setBytes:&x length:sizeof(x) atIndex:i]
 #define ENC_ARRAY(encoder, x, i) [encoder setBytes:x length:sizeof(x) atIndex:i]
+// std::array flavour — C arrays cannot be captured inside Obj-C blocks.
+#define ENC_STDARR(encoder, x, i) [encoder setBytes:x.data() length:sizeof(x) atIndex:i]
 #define ENC_BUF(encoder, x, i) [encoder setBuffer:x.buffer() offset:0 atIndex:i]
 
 id<MTLDevice> msplat_device() {
@@ -438,6 +458,34 @@ struct FusedTensorCache {
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
         prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+    }
+
+    // Flow splatting buffers (Phase 3). Allocated only when a flow pass actually
+    // runs, so a plain 3D/4D run pays nothing for them.
+    int flow_capacity = 0, flow_img_h = 0, flow_img_w = 0;
+    MTensor packed_flow, out_flow, v_flow_img, flow_loss_sum;
+    // Borrowed for the duration of one flow pass — the caller owns the storage
+    // because it has to survive densification alongside the other per-gaussian
+    // buffers.
+    MTensor flow2d_scratch;
+
+    // [0] = flow loss, [1] = rigid loss. Needed even by a rigid-only run.
+    void ensure_loss_sums(id<MTLDevice> dev) {
+        if (!flow_loss_sum.defined())
+            flow_loss_sum = mtensor_empty(dev, {2}, DType::Float32);
+    }
+
+    void ensure_flow(int64_t cap, int ih, int iw, id<MTLDevice> dev) {
+        if (cap != flow_capacity) {
+            flow_capacity = (int)cap;
+            packed_flow = mtensor_empty(dev, {cap, 2}, DType::Float32);
+        }
+        if (ih != flow_img_h || iw != flow_img_w) {
+            flow_img_h = ih; flow_img_w = iw;
+            out_flow = mtensor_empty(dev, {ih, iw, 2}, DType::Float32);
+            v_flow_img = mtensor_empty(dev, {ih, iw, 2}, DType::Float32);
+        }
+        ensure_loss_sums(dev);
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
@@ -1463,64 +1511,316 @@ MTensor& msplat_train_v_mean3d() {
     return g_tcache.v_mean3d;
 }
 
-void msplat_deform_means_forward(
-    int num_points, MTensor &means, MTensor &deform,
-    float tau, int n_poly, int n_fourier, MTensor &means_t
+MTensor& msplat_train_v_quat() {
+    return g_tcache.v_quat;
+}
+
+// Per-gaussian projected radii from the last forward pass; <= 0 marks a gaussian
+// the projection culled, which the flow pass has to skip.
+MTensor& msplat_forward_radii() {
+    return g_tcache.radii_out;
+}
+
+// Per-point dispatch helper — every 4D kernel below is one thread per gaussian.
+static inline void dispatch_per_point(id<MTLComputeCommandEncoder> enc,
+                                      id<MTLComputePipelineState> cpso, int n) {
+    NSUInteger tpg = MIN(cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+void msplat_deform_forward(
+    int num_points, MTensor &means, MTensor &quats, MTensor &deform,
+    float tau, DeformOrders ord, MTensor &means_t, MTensor &quats_t
 ) {
     MetalContext* ctx = get_global_context();
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
     assert(command_buffer && "Failed to retrieve command buffer reference");
+    std::array<int32_t, 4> orders = {ord.nPoly, ord.nFourier, ord.qPoly, ord.qFourier};
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-        NSUInteger tpg = MIN(ctx->deform_means_forward_kernel_cpso.maxTotalThreadsPerThreadgroup,
-                             (NSUInteger)num_points);
-        [enc setComputePipelineState:ctx->deform_means_forward_kernel_cpso];
+        [enc setComputePipelineState:ctx->deform_forward_kernel_cpso];
         ENC_SCALAR(enc, num_points, 0);
         ENC_BUF(enc, means, 1);
-        ENC_BUF(enc, deform, 2);
-        ENC_SCALAR(enc, tau, 3);
-        ENC_SCALAR(enc, n_poly, 4);
-        ENC_SCALAR(enc, n_fourier, 5);
+        ENC_BUF(enc, quats, 2);
+        ENC_BUF(enc, deform, 3);
+        ENC_SCALAR(enc, tau, 4);
+        ENC_STDARR(enc, orders, 5);
         ENC_BUF(enc, means_t, 6);
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        // Rotation off → the kernel returns before touching buffer 7, but Metal
+        // still wants something bound; means_t is a valid, correctly sized stand-in.
+        MTensor &qt = ord.hasRot() ? quats_t : means_t;
+        ENC_BUF(enc, qt, 7);
+        dispatch_per_point(enc, ctx->deform_forward_kernel_cpso, num_points);
         [enc endEncoding];
     });
 }
 
-void msplat_deform_means_backward_adam(
-    int num_points, MTensor &v_mean3d, MTensor &deform,
+void msplat_deform_backward_adam(
+    int num_points, MTensor &v_mean3d, MTensor &v_quat, MTensor &deform,
     MTensor &exp_avg, MTensor &exp_avg_sq,
-    float tau, int n_poly, int n_fourier,
-    float step_size, float beta1, float beta2, float bc2_sqrt, float eps
+    float tau, DeformOrders ord,
+    float step_size_means, float step_size_rot,
+    float beta1, float beta2, float bc2_sqrt, float eps,
+    MTensor &v_mu_extra, MTensor &v_vel
 ) {
     MetalContext* ctx = get_global_context();
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
     assert(command_buffer && "Failed to retrieve command buffer reference");
+    std::array<int32_t, 4> orders = {ord.nPoly, ord.nFourier, ord.qPoly, ord.qFourier};
+    std::array<float, 4> steps = {step_size_means, step_size_rot, beta1, beta2};
+    std::array<float, 2> bc2_eps = {bc2_sqrt, eps};
+    std::array<int32_t, 2> has_extra = {v_mu_extra.defined() ? 1 : 0, v_vel.defined() ? 1 : 0};
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-        NSUInteger tpg = MIN(ctx->deform_means_backward_adam_kernel_cpso.maxTotalThreadsPerThreadgroup,
-                             (NSUInteger)num_points);
-        [enc setComputePipelineState:ctx->deform_means_backward_adam_kernel_cpso];
+        [enc setComputePipelineState:ctx->deform_backward_adam_kernel_cpso];
         ENC_SCALAR(enc, num_points, 0);
         ENC_BUF(enc, v_mean3d, 1);
-        ENC_BUF(enc, deform, 2);
-        ENC_BUF(enc, exp_avg, 3);
-        ENC_BUF(enc, exp_avg_sq, 4);
-        ENC_SCALAR(enc, tau, 5);
-        ENC_SCALAR(enc, n_poly, 6);
-        ENC_SCALAR(enc, n_fourier, 7);
-        ENC_SCALAR(enc, step_size, 8);
-        ENC_SCALAR(enc, beta1, 9);
-        ENC_SCALAR(enc, beta2, 10);
-        ENC_SCALAR(enc, bc2_sqrt, 11);
-        ENC_SCALAR(enc, eps, 12);
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        ENC_BUF(enc, v_quat, 2);
+        ENC_BUF(enc, deform, 3);
+        ENC_BUF(enc, exp_avg, 4);
+        ENC_BUF(enc, exp_avg_sq, 5);
+        ENC_SCALAR(enc, tau, 6);
+        ENC_STDARR(enc, orders, 7);
+        ENC_STDARR(enc, steps, 8);
+        ENC_STDARR(enc, bc2_eps, 9);
+        MTensor &mu_x = has_extra[0] ? v_mu_extra : v_mean3d;
+        MTensor &vel_x = has_extra[1] ? v_vel : v_mean3d;
+        ENC_BUF(enc, mu_x, 10);
+        ENC_BUF(enc, vel_x, 11);
+        ENC_STDARR(enc, has_extra, 12);
+        dispatch_per_point(enc, ctx->deform_backward_adam_kernel_cpso, num_points);
         [enc endEncoding];
     });
+}
+
+// ============================================================================
+// Phase 3 — flow splatting
+// ============================================================================
+
+void msplat_velocity_field(
+    int num_points, MTensor &deform, float tau, DeformOrders ord, MTensor &velocity,
+    MTensor &v_vel, MTensor &v_mu_extra
+) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    std::array<int32_t, 4> orders = {ord.nPoly, ord.nFourier, ord.qPoly, ord.qFourier};
+    dispatch_sync(ctx->d_queue, ^(){
+        // This is the entry point of the whole Phase-3 block, so it owns clearing
+        // the two gradient accumulators that L_flow and L_rigid then add into.
+        // GPU-side, because a CPU memset would race with the previous step.
+        if (v_vel.defined() || v_mu_extra.defined()) {
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            if (v_vel.defined())
+                [blit fillBuffer:v_vel.buffer() range:NSMakeRange(0, v_vel.nbytes()) value:0];
+            if (v_mu_extra.defined())
+                [blit fillBuffer:v_mu_extra.buffer()
+                           range:NSMakeRange(0, v_mu_extra.nbytes()) value:0];
+            [blit endEncoding];
+        }
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->velocity_field_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, deform, 1);
+        ENC_SCALAR(enc, tau, 2);
+        ENC_STDARR(enc, orders, 3);
+        ENC_BUF(enc, velocity, 4);
+        dispatch_per_point(enc, ctx->velocity_field_kernel_cpso, num_points);
+        [enc endEncoding];
+    });
+}
+
+// Shared front half of both flow entry points: per-gaussian 2D flow → packed
+// order → composited flow image. Everything it reads (tile_bins, gaussian_ids,
+// packed_xy_opac/conic, the tile capacity) comes from the immediately preceding
+// forward pass, which is why the caller must not run another camera in between.
+static void encode_flow_forward(
+    id<MTLComputeCommandEncoder> enc, MetalContext *ctx,
+    int num_points, MTensor &means_t, MTensor &velocity, MTensor &radii,
+    MTensor &projmat_cur, MTensor &projmat_next,
+    unsigned img_height, unsigned img_width, float cx, float cy, float dt
+) {
+    std::array<uint32_t, 2> img_size2 = {img_width, img_height};
+    std::array<float, 2> principal = {cx, cy};
+    uint32_t packed_count = (uint32_t)g_tcache.capacity;
+
+    [enc setComputePipelineState:ctx->flow_project_kernel_cpso];
+    ENC_SCALAR(enc, num_points, 0);
+    ENC_BUF(enc, means_t, 1);
+    ENC_BUF(enc, velocity, 2);
+    ENC_BUF(enc, radii, 3);
+    ENC_BUF(enc, projmat_cur, 4);
+    ENC_BUF(enc, projmat_next, 5);
+    ENC_STDARR(enc, img_size2, 6);
+    ENC_STDARR(enc, principal, 7);
+    ENC_SCALAR(enc, dt, 8);
+    ENC_BUF(enc, g_tcache.flow2d_scratch, 9);
+    dispatch_per_point(enc, ctx->flow_project_kernel_cpso, num_points);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [enc setComputePipelineState:ctx->pack_flow_kernel_cpso];
+    ENC_SCALAR(enc, packed_count, 0);
+    ENC_BUF(enc, g_tcache.gaussian_ids, 1);
+    ENC_BUF(enc, g_tcache.flow2d_scratch, 2);
+    ENC_BUF(enc, g_tcache.packed_flow, 3);
+    dispatch_per_point(enc, ctx->pack_flow_kernel_cpso, (int)packed_count);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    std::array<uint32_t, 4> rast_tb = {(img_width + 15u) / 16u, (img_height + 15u) / 16u, 1, 0xDEAD};
+    std::array<uint32_t, 4> rast_isz = {img_width, img_height, 1, 0xDEAD};
+    std::array<int32_t, 2> block2 = {RAST_BLOCK_X, RAST_BLOCK_Y};
+    [enc setComputePipelineState:ctx->flow_rasterize_forward_kernel_cpso];
+    ENC_STDARR(enc, rast_tb, 0);
+    ENC_STDARR(enc, rast_isz, 1);
+    ENC_BUF(enc, g_tcache.tile_bins, 2);
+    ENC_BUF(enc, g_tcache.packed_xy_opac, 3);
+    ENC_BUF(enc, g_tcache.packed_conic, 4);
+    ENC_BUF(enc, g_tcache.packed_flow, 5);
+    ENC_BUF(enc, g_tcache.out_flow, 6);
+    ENC_STDARR(enc, block2, 7);
+    [enc dispatchThreadgroups:MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X,
+                                          (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1)
+        threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+}
+
+MTensor& msplat_flow_render(
+    int num_points, MTensor &means_t, MTensor &velocity, MTensor &radii,
+    MTensor &projmat_cur, MTensor &projmat_next,
+    unsigned img_height, unsigned img_width, float cx, float cy,
+    float dt, MTensor &flow2d
+) {
+    MetalContext* ctx = get_global_context();
+    g_tcache.ensure_flow(g_tcache.capacity, img_height, img_width, ctx->device);
+    g_tcache.flow2d_scratch = flow2d;
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit fillBuffer:g_tcache.out_flow.buffer()
+                   range:NSMakeRange(0, g_tcache.out_flow.nbytes()) value:0];
+        [blit endEncoding];
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        encode_flow_forward(enc, ctx, num_points, means_t, velocity, radii,
+                            projmat_cur, projmat_next, img_height, img_width, cx, cy, dt);
+        [enc endEncoding];
+    });
+    msplat_gpu_sync();
+    return g_tcache.out_flow;
+}
+
+float msplat_flow_step(
+    int num_points, MTensor &means_t, MTensor &velocity, MTensor &radii,
+    MTensor &projmat_cur, MTensor &projmat_next,
+    unsigned img_height, unsigned img_width, float cx, float cy,
+    float dt, MTensor &gt_flow, float grad_weight, float min_coverage,
+    MTensor &v_vel, MTensor &v_mu_extra, MTensor &flow2d, MTensor &v_flow2d
+) {
+    MetalContext* ctx = get_global_context();
+    g_tcache.ensure_flow(g_tcache.capacity, img_height, img_width, ctx->device);
+    g_tcache.flow2d_scratch = flow2d;
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+
+    std::array<uint32_t, 2> img_size2 = {img_width, img_height};
+    float inv_n = 1.0f / (float)(img_height * img_width * 2);
+    float grad_scale = grad_weight * inv_n;
+
+    dispatch_sync(ctx->d_queue, ^(){
+        // GPU-side zeroing: a CPU memset would race with the previous command
+        // buffer still reading these.
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit fillBuffer:g_tcache.out_flow.buffer()
+                   range:NSMakeRange(0, g_tcache.out_flow.nbytes()) value:0];
+        [blit fillBuffer:v_flow2d.buffer() range:NSMakeRange(0, v_flow2d.nbytes()) value:0];
+        // slot 1 belongs to L_rigid, which clears it itself
+        [blit fillBuffer:g_tcache.flow_loss_sum.buffer()
+                   range:NSMakeRange(0, sizeof(float)) value:0];
+        [blit endEncoding];
+
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        encode_flow_forward(enc, ctx, num_points, means_t, velocity, radii,
+                            projmat_cur, projmat_next, img_height, img_width, cx, cy, dt);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Loss + d L / d F
+        [enc setComputePipelineState:ctx->flow_loss_kernel_cpso];
+        ENC_STDARR(enc, img_size2, 0);
+        ENC_BUF(enc, g_tcache.out_flow, 1);
+        ENC_BUF(enc, gt_flow, 2);
+        ENC_BUF(enc, g_tcache.final_Ts, 3);
+        ENC_SCALAR(enc, inv_n, 4);
+        ENC_SCALAR(enc, grad_scale, 5);
+        ENC_SCALAR(enc, min_coverage, 6);
+        ENC_BUF(enc, g_tcache.v_flow_img, 7);
+        ENC_BUF(enc, g_tcache.flow_loss_sum, 8);
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Backward through the compositing, then through the projection.
+        std::array<uint32_t, 4> rast_tb = {(img_width + 15u) / 16u, (img_height + 15u) / 16u, 1, 0xDEAD};
+        std::array<uint32_t, 4> rast_isz = {img_width, img_height, 1, 0xDEAD};
+        std::array<int32_t, 2> block2 = {16, 16};
+        [enc setComputePipelineState:ctx->flow_rasterize_backward_kernel_cpso];
+        ENC_STDARR(enc, rast_tb, 0);
+        ENC_STDARR(enc, rast_isz, 1);
+        ENC_BUF(enc, g_tcache.tile_bins, 2);
+        ENC_BUF(enc, g_tcache.gaussian_ids, 3);
+        ENC_BUF(enc, g_tcache.packed_xy_opac, 4);
+        ENC_BUF(enc, g_tcache.packed_conic, 5);
+        ENC_BUF(enc, g_tcache.v_flow_img, 6);
+        ENC_BUF(enc, v_flow2d, 7);
+        ENC_STDARR(enc, block2, 8);
+        [enc dispatchThreadgroups:MTLSizeMake((img_width + 15) / 16, (img_height + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc setComputePipelineState:ctx->flow_project_backward_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, means_t, 1);
+        ENC_BUF(enc, radii, 2);
+        ENC_BUF(enc, projmat_cur, 3);
+        ENC_BUF(enc, projmat_next, 4);
+        ENC_STDARR(enc, img_size2, 5);
+        ENC_SCALAR(enc, dt, 6);
+        ENC_BUF(enc, v_flow2d, 7);
+        ENC_BUF(enc, v_vel, 8);
+        ENC_BUF(enc, v_mu_extra, 9);
+        dispatch_per_point(enc, ctx->flow_project_backward_kernel_cpso, num_points);
+        [enc endEncoding];
+    });
+
+    // Unsynced read of shared memory — the value can be one step stale, which is
+    // the same trade-off msplat_train_step makes for the colour loss.
+    return *g_tcache.flow_loss_sum.data<float>();
+}
+
+float msplat_rigid_step(
+    int num_points, MTensor &means, MTensor &velocity, MTensor &neighbors,
+    int k, float beta, float weight, MTensor &v_vel
+) {
+    MetalContext* ctx = get_global_context();
+    g_tcache.ensure_loss_sums(ctx->device);
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit fillBuffer:g_tcache.flow_loss_sum.buffer()
+                   range:NSMakeRange(sizeof(float), sizeof(float)) value:0];
+        [blit endEncoding];
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->rigid_loss_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, means, 1);
+        ENC_BUF(enc, velocity, 2);
+        ENC_BUF(enc, neighbors, 3);
+        ENC_SCALAR(enc, k, 4);
+        ENC_SCALAR(enc, beta, 5);
+        ENC_SCALAR(enc, weight, 6);
+        ENC_BUF(enc, v_vel, 7);
+        [enc setBuffer:g_tcache.flow_loss_sum.buffer() offset:sizeof(float) atIndex:8];
+        dispatch_per_point(enc, ctx->rigid_loss_kernel_cpso, num_points);
+        [enc endEncoding];
+    });
+    return g_tcache.flow_loss_sum.data<float>()[1];
 }
 
 // ============================================================================

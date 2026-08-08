@@ -45,8 +45,8 @@ Model::Model(const InputData &inputData, int numCameras,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs,
     const float* bgColor,
-    int deformNPoly, int deformNFourier, float deformLr)
-    : deformNPoly(deformNPoly), deformNFourier(deformNFourier), deformLr(deformLr),
+    const DeformConfig &deformCfg)
+    : dcfg(deformCfg),
       numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
@@ -121,12 +121,13 @@ Model::Model(const InputData &inputData, int numCameras,
         for (int64_t i = 0; i < numPoints; i++) op[i] = logit01;
     }
 
-    // 4D trajectory coefficients, all zero: mu(t) == mu at every t, so training
-    // starts from exactly the static model and only departs from it as the
-    // coefficients pick up gradient.
+    // 4D trajectory coefficients, all zero: mu(t) == mu and q(t) == q at every
+    // t, so training starts from exactly the static model and only departs from
+    // it as the coefficients pick up gradient.
     if (is4D()) {
         deform = gpu_zeros({numPoints, (int64_t)deformStride()}, DType::Float32);
         means_t = gpu_empty({numPoints, 3}, DType::Float32);
+        if (hasRot()) quats_t = gpu_empty({numPoints, 4}, DType::Float32);
     }
 
     // Background color — default is magenta (high-contrast against typical scenes,
@@ -167,7 +168,7 @@ void Model::setupOptimizers(){
         adam_exp_avg_sq_buf[g] = gpu_zeros(shape, DType::Float32);
         adam_lr[g] = lr_init[g];
     }
-    if (is4D()) adam_lr[6] = deformLr;
+    if (is4D()) adam_lr[6] = dcfg.lr;
     adam_step_count = 0;
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
@@ -188,6 +189,7 @@ void Model::setupOptimizers(){
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
+    rebuildNeighbors();
 }
 
 void Model::releaseOptimizers(){
@@ -197,7 +199,9 @@ void Model::releaseOptimizers(){
     }
     means_buf.reset(); scales_buf.reset(); quats_buf.reset();
     featuresDc_buf.reset(); featuresRest_buf.reset(); opacities_buf.reset();
-    deform_buf.reset(); means_t.reset();
+    deform_buf.reset(); means_t.reset(); quats_t.reset();
+    velocity.reset(); v_vel.reset(); v_mu_extra.reset();
+    flow2d.reset(); v_flow2d.reset(); neighbors.reset();
     densify_split_flag.reset(); densify_dup_flag.reset();
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
@@ -218,9 +222,19 @@ void Model::refreshViews(){
     opacities = opacities_buf.view(num_active);
     if (is4D()) {
         deform = deform_buf.view(num_active);
-        // means_t is per-step scratch, not a densified buffer. refreshViews only
+        // These are per-step scratch, not densified buffers. refreshViews only
         // runs on densification, so reallocating here is not on the hot path.
         means_t = gpu_empty({(int64_t)num_active, 3}, DType::Float32);
+        if (hasRot()) quats_t = gpu_empty({(int64_t)num_active, 4}, DType::Float32);
+        if (dcfg.anyPhase3()) {
+            velocity = gpu_zeros({(int64_t)num_active, 3}, DType::Float32);
+            v_vel = gpu_zeros({(int64_t)num_active, 3}, DType::Float32);
+            v_mu_extra = gpu_zeros({(int64_t)num_active, 3}, DType::Float32);
+        }
+        if (dcfg.flow) {
+            flow2d = gpu_zeros({(int64_t)num_active, 2}, DType::Float32);
+            v_flow2d = gpu_zeros({(int64_t)num_active, 2}, DType::Float32);
+        }
     }
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
         if (!adam_exp_avg_buf[g].defined()) continue;
@@ -319,6 +333,7 @@ void Model::afterTrain(int step){
 
             num_active = new_count;
             refreshViews();
+            rebuildNeighbors();   // the kNN graph is stale once the point set changed
             std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
         }
 
@@ -359,7 +374,7 @@ void Model::savePlyAt(const std::string &filename, int step, float time, int max
     // deformedMeans() returns the canonical means for a static model, so this
     // stays correct (and time-independent) when no trajectory is trained.
     MTensor &m = deformedMeans(time);
-    GaussianParams p{m, scales, quats, featuresDc, featuresRest, opacities,
+    GaussianParams p{m, scales, deformedQuats(), featuresDc, featuresRest, opacities,
                      scale, {translation[0], translation[1], translation[2]}, keepCrs};
     saveGaussianPly(filename, p, step, maxShBases);
 }
@@ -405,7 +420,9 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 1;
+// v2: the 4D block stores four trajectory orders (means + rotation) instead of
+// two, and `deform` holds the combined means/rotation coefficients.
+static constexpr uint32_t CKPT_VERSION = 2;
 
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
@@ -471,9 +488,9 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     uint32_t has4D = is4D() ? 1u : 0u;
     f.write(reinterpret_cast<const char*>(&has4D), sizeof(has4D));
     if (has4D) {
-        uint32_t np = (uint32_t)deformNPoly, nf = (uint32_t)deformNFourier;
-        f.write(reinterpret_cast<const char*>(&np), sizeof(np));
-        f.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+        uint32_t ord[4] = {(uint32_t)dcfg.ord.nPoly, (uint32_t)dcfg.ord.nFourier,
+                           (uint32_t)dcfg.ord.qPoly, (uint32_t)dcfg.ord.qFourier};
+        f.write(reinterpret_cast<const char*>(ord), sizeof(ord));
         writeTensor(f, deform);
         writeTensor(f, adam_exp_avg[6]);
         writeTensor(f, adam_exp_avg_sq[6]);
@@ -525,16 +542,17 @@ int Model::loadCheckpoint(const std::string &filename) {
     uint32_t has4D = 0;
     f.read(reinterpret_cast<char*>(&has4D), sizeof(has4D));
     if (f && has4D) {
-        uint32_t np = 0, nf = 0;
-        f.read(reinterpret_cast<char*>(&np), sizeof(np));
-        f.read(reinterpret_cast<char*>(&nf), sizeof(nf));
-        deformNPoly = (int)np;
-        deformNFourier = (int)nf;
+        uint32_t ord[4] = {};
+        f.read(reinterpret_cast<char*>(ord), sizeof(ord));
+        dcfg.ord.nPoly = (int)ord[0];
+        dcfg.ord.nFourier = (int)ord[1];
+        dcfg.ord.qPoly = (int)ord[2];
+        dcfg.ord.qFourier = (int)ord[3];
         deform = readTensor(f);
         adam_exp_avg[6] = readTensor(f);
         adam_exp_avg_sq[6] = readTensor(f);
     } else {
-        deformNPoly = deformNFourier = 0;
+        dcfg.ord = DeformOrders{};
     }
 
     f.close();
@@ -645,9 +663,38 @@ static inline float deformTau(float time) { return time - 0.5f; }
 
 MTensor& Model::deformedMeans(float time) {
     if (!is4D()) return means;
-    msplat_deform_means_forward(means.size(0), means, deform,
-                                deformTau(time), deformNPoly, deformNFourier, means_t);
+    msplat_deform_forward(means.size(0), means, quats, deform,
+                          deformTau(time), dcfg.ord, means_t, quats_t);
     return means_t;
+}
+
+// k nearest neighbours of every gaussian in the CANONICAL means, for L_rigid.
+// Rebuilt after every densification rather than every step: a kNN query over
+// hundreds of thousands of points costs far more than a training step, and
+// "locally rigid" is a statement about the canonical neighbourhood anyway.
+void Model::rebuildNeighbors() {
+    if (!dcfg.rigid) return;
+    msplat_gpu_sync();
+    int64_t n = means.size(0);
+    int k = std::min<int>(dcfg.rigidK, (int)std::max<int64_t>(1, n - 1));
+    neighbors = gpu_empty({n, (int64_t)k}, DType::Int32);
+    int32_t *out = neighbors.data<int32_t>();
+
+    PointsTensor pt(means.data<float>(), n);
+    PointsTensor::KdTree index(3, pt, {10});
+    // k+1 because the query point is its own nearest neighbour.
+    std::vector<size_t> idx(k + 1);
+    std::vector<float> dist(k + 1);
+    for (int64_t i = 0; i < n; i++) {
+        size_t found = index.knnSearch(&means.data<float>()[i * 3], k + 1,
+                                       idx.data(), dist.data());
+        int w = 0;
+        for (size_t j = 0; j < found && w < k; j++) {
+            if ((int64_t)idx[j] == i) continue;
+            out[i * k + w++] = (int32_t)idx[j];
+        }
+        while (w < k) out[i * k + w++] = -1;   // fewer than k points available
+    }
 }
 
 MTensor Model::render(Camera& cam, int step){
@@ -655,13 +702,35 @@ MTensor Model::render(Camera& cam, int step){
     MTensor &m = deformedMeans(cam.time);
     return msplat_render(
         means.size(0), m, scales, 1.0f,
-        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        deformedQuats(), cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
         opacities, backgroundColor);
 }
 
-void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
+MTensor Model::renderFlow(Camera& cam, Camera& nextCam, int step, float dt){
+    if (!is4D())
+        throw std::runtime_error("renderFlow: model has no trajectory (not a 4D run)");
+    auto s = prepareCam(cam, step);
+    prepareCam(nextCam, step);
+    // The colour pass is what fills the sorted tile lists the flow compositing
+    // walks; without it the flow render would read stale or empty bins.
+    (void)render(cam, step);
+
+    int n = means.size(0);
+    if (!velocity.defined() || velocity.size(0) != n)
+        velocity = gpu_zeros({(int64_t)n, 3}, DType::Float32);
+    if (!flow2d.defined() || flow2d.size(0) != n)
+        flow2d = gpu_zeros({(int64_t)n, 2}, DType::Float32);
+    MTensor none;
+    msplat_velocity_field(n, deform, deformTau(cam.time), dcfg.ord, velocity, none, none);
+    return msplat_flow_render(n, means_t, velocity, msplat_forward_radii(),
+                              cam.cachedProjViewMat, nextCam.cachedProjViewMat,
+                              s.height, s.width, s.cx, s.cy, dt, flow2d);
+}
+
+void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
+                          Camera* nextCam){
     auto s = prepareCam(cam, step);
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
@@ -710,7 +779,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
 
     auto [r, loss] = msplat_train_step(
         numPoints, m, scales, 1.0f,
-        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        deformedQuats(), cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
         opacities, backgroundColor, gt, window2d, ssimWeight,
@@ -722,11 +791,53 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         visCounts, xysGradNorm, max2DSize, invMaxDim);
 
     if (is4D()) {
-        msplat_deform_means_backward_adam(
-            numPoints, msplat_train_v_mean3d(), deform,
+        // ── Phase 3 ──────────────────────────────────────────────────────────
+        // Everything below only accumulates into v_vel / v_mu_extra; the single
+        // Adam step for the whole coefficient block comes afterwards. Two Adam
+        // steps on the same tensor in one iteration would corrupt the moments.
+        MTensor noTensor;
+        bool ranPhase3 = false;
+        if (dcfg.anyPhase3()) {
+            msplat_velocity_field(numPoints, deform, deformTau(cam.time), dcfg.ord,
+                                  velocity, v_vel, v_mu_extra);
+            ranPhase3 = true;
+        }
+
+        if (dcfg.flow && nextCam && cam.hasFlow()) {
+            MTensor *gtFlow = cam.getGPUFlow();
+            // The progressive downscale changes the pixel grid the flow lives on;
+            // rather than resample the ground truth, skip those steps. With
+            // --num-downscales 0 (the recipe for every 4D run here) this never
+            // triggers after the first resolution step.
+            if (gtFlow && s.width == cam.width && s.height == cam.height) {
+                prepareCam(*nextCam, step);   // makes sure its proj matrix is built
+                lastFlowLoss = msplat_flow_step(
+                    numPoints, m, velocity, r,
+                    cam.cachedProjViewMat, nextCam->cachedProjViewMat,
+                    s.height, s.width, s.cx, s.cy, cam.flowDt,
+                    *gtFlow, dcfg.flowWeight, dcfg.flowMinCoverage,
+                    v_vel, v_mu_extra, flow2d, v_flow2d);
+                flowSteps++;
+            } else {
+                flowSkippedSteps++;
+            }
+        }
+
+        if (dcfg.rigid && neighbors.defined() && neighbors.size(0) == numPoints) {
+            int k = (int)neighbors.size(1);
+            lastRigidLoss = msplat_rigid_step(
+                numPoints, means, velocity, neighbors, k, dcfg.rigidBeta,
+                dcfg.rigidWeight / (float)(k * numPoints), v_vel);
+        }
+
+        msplat_deform_backward_adam(
+            numPoints, msplat_train_v_mean3d(), msplat_train_v_quat(), deform,
             adam_exp_avg[6], adam_exp_avg_sq[6],
-            deformTau(cam.time), deformNPoly, deformNFourier,
-            adam_lr[6] / bc1, adam_beta1, adam_beta2, std::sqrt(bc2), adam_eps);
+            deformTau(cam.time), dcfg.ord,
+            adam_lr[6] / bc1, dcfg.rotLr / bc1,
+            adam_beta1, adam_beta2, std::sqrt(bc2), adam_eps,
+            ranPhase3 ? v_mu_extra : noTensor,
+            ranPhase3 ? v_vel : noTensor);
     }
 
     radii = r;

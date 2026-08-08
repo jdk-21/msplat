@@ -4,10 +4,30 @@
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include "bindings.h"   // DeformOrders
 
 int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
 float l1_loss(const MTensor& rendered, const MTensor& gt);
+
+// Everything the 4D/flow extension adds to a training run, kept together so the
+// three frontends can hand it through as one value instead of a dozen scalars.
+struct DeformConfig {
+  DeformOrders ord;             // trajectory orders for means and rotation
+  float lr = 0.0f;              // Adam lr for the means trajectory coefficients
+  float rotLr = 0.0f;           // Adam lr for the rotation coefficients
+
+  // ── Phase 3 ───────────────────────────────────────────────────────────────
+  bool flow = false;            // render optical flow and apply L_flow
+  float flowWeight = 0.03f;     // gamma2 in L = L_color + gamma2*L_flow + gamma3*L_rigid
+  float flowMinCoverage = 0.1f; // ignore pixels the model leaves (near-)empty
+  bool rigid = false;           // apply L_rigid over the kNN graph
+  float rigidWeight = 0.5f;     // gamma3
+  float rigidBeta = 100.0f;     // w_ij = exp(-beta * ||mu_i - mu_j||)
+  int rigidK = 20;              // neighbours per gaussian
+  bool any4D() const { return ord.any(); }
+  bool anyPhase3() const { return flow || rigid; }
+};
 
 struct Model{
   Model(const InputData &inputData, int numCameras,
@@ -15,7 +35,7 @@ struct Model{
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr,
-        int deformNPoly = 0, int deformNFourier = 0, float deformLr = 0.0f);
+        const DeformConfig &deformCfg = DeformConfig{});
 
   ~Model(){ releaseOptimizers(); }
 
@@ -45,8 +65,15 @@ struct Model{
     float cam_pos[3];
   };
   CamSetup prepareCam(Camera& cam, int step);
-  void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
+  // nextCam is the frame this camera's ground-truth optical flow points at.
+  // Pass nullptr (or leave it out) to skip the flow pass for this step.
+  void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
+                     Camera* nextCam = nullptr);
   MTensor render(Camera& cam, int step);
+  // The optical flow this model predicts from cam to nextCam over dt, as an
+  // (H, W, 2) image in pixels per frame interval. Runs a colour forward pass
+  // first because the flow compositing reuses its sorted tile lists.
+  MTensor renderFlow(Camera& cam, Camera& nextCam, int step, float dt);
 
   MTensor means;
   MTensor scales;
@@ -55,21 +82,38 @@ struct Model{
   MTensor featuresRest;
   MTensor opacities;
 
-  // ── 4D (Phase 2) ──────────────────────────────────────────────────────────
-  // Trajectory coefficients, (N, 3*deformBasisCount()). Empty for a static run.
+  // ── 4D (Phase 2) / flow splatting (Phase 3) ───────────────────────────────
+  // One combined coefficient block per gaussian, (N, deformStride()):
+  // [ deformBasisCount() float3 means blocks | rotBasisCount() float4 rotation
+  // blocks ]. Empty for a static run. Keeping it in a single tensor is what lets
+  // densification carry the whole 4D state as one extra buffer.
   MTensor deform;
-  int deformNPoly = 0;      // polynomial order; 0 disables the whole 4D path
-  int deformNFourier = 0;   // Fourier order
-  float deformLr = 0.0f;    // Adam lr for the trajectory group
-  bool is4D() const { return deformNPoly > 0 || deformNFourier > 0; }
-  int deformBasisCount() const { return deformNPoly + 2 * deformNFourier; }
-  int deformStride() const { return 3 * deformBasisCount(); }
-  // Evaluates mu(t) into means_t and returns it; returns the canonical means
-  // for a static model, so callers can use the result unconditionally.
+  DeformConfig dcfg;
+  bool is4D() const { return dcfg.ord.any(); }
+  bool hasRot() const { return dcfg.ord.hasRot(); }
+  int deformBasisCount() const { return dcfg.ord.basisM(); }
+  int rotBasisCount() const { return dcfg.ord.basisQ(); }
+  int deformStride() const { return dcfg.ord.stride(); }
+  // Evaluates mu(t) into means_t (and q(t) into quats_t) and returns the means;
+  // returns the canonical means for a static model, so callers can use the
+  // result unconditionally. deformedQuats() likewise falls back to quats.
   MTensor& deformedMeans(float time);
+  MTensor& deformedQuats() { return hasRot() ? quats_t : quats; }
   MTensor means_t;          // scratch holding mu(t) for the current camera
+  MTensor quats_t;          // scratch holding q(t)
 
-  static constexpr int N_ADAM_GROUPS = 7;  // 6 static + 1 trajectory group
+  // Phase 3 scratch. velocity/v_vel/v_mu_extra/flow2d/v_flow2d are per-gaussian
+  // and reallocated by refreshViews(); neighbors is the kNN graph over the
+  // canonical means, rebuilt after every densification.
+  MTensor velocity, v_vel, v_mu_extra, flow2d, v_flow2d;
+  MTensor neighbors;
+  void rebuildNeighbors();
+  float lastFlowLoss = 0.0f, lastRigidLoss = 0.0f;
+  // Steps that actually ran a flow pass, and steps that had to skip it because
+  // the progressive downscale did not match the ground-truth flow resolution.
+  long flowSteps = 0, flowSkippedSteps = 0;
+
+  static constexpr int N_ADAM_GROUPS = 7;  // 6 static + 1 combined 4D group
   MTensor adam_exp_avg[N_ADAM_GROUPS];
   MTensor adam_exp_avg_sq[N_ADAM_GROUPS];
   int adam_step_count = 0;

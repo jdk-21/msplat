@@ -21,12 +21,14 @@ struct Dataset::Impl {
     InputData data;
     std::vector<Camera> trainCams;
     std::vector<Camera> testCams;
+    std::string path;   // kept for the Phase-3 flow lookup under <path>/flow/
 };
 
 Dataset::Dataset(const std::string& path, float downscaleFactor,
                  bool evalMode, int testEvery, bool whiteBackground)
     : impl(std::make_unique<Impl>())
 {
+    impl->path = path;
     impl->data = inputDataFromX(path, "", whiteBackground);
 
     for (auto& cam : impl->data.cameras)
@@ -84,6 +86,29 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     impl->config = config;
     impl->ds = static_cast<Dataset::Impl*>(dataset._handle());
 
+    DeformConfig dc;
+    dc.ord = {config.deformNPoly, config.deformNFourier,
+              config.deformRotNPoly, config.deformRotNFourier};
+    dc.lr = config.deformLr;
+    dc.rotLr = config.deformRotLr;
+    dc.flow = config.flow;
+    dc.flowWeight = config.flowWeight;
+    dc.flowMinCoverage = config.flowMinCoverage;
+    dc.rigid = config.rigid;
+    dc.rigidWeight = config.rigidWeight;
+    dc.rigidBeta = config.rigidBeta;
+    dc.rigidK = config.rigidK;
+    if (dc.flow) {
+        int n = attachFlowToCameras(impl->ds->trainCams, impl->ds->path);
+        fprintf(stderr, "Flow: %d of %zu train frames have ground-truth flow\n",
+                n, impl->ds->trainCams.size());
+        if (n == 0) {
+            fprintf(stderr, "Flow: nothing found under %s/flow — L_flow disabled\n",
+                    impl->ds->path.c_str());
+            dc.flow = false;
+        }
+    }
+
     impl->model = std::make_unique<Model>(
         impl->ds->data,
         (int)impl->ds->trainCams.size(),
@@ -94,7 +119,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs,
         config.bgColor,
-        config.deformNPoly, config.deformNFourier, config.deformLr
+        dc
     );
 
     impl->camIndices.resize(impl->ds->trainCams.size());
@@ -114,7 +139,8 @@ Stats Trainer::step() {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
+    Camera* nextCam = cam.flowNextIdx >= 0 ? &impl->ds->trainCams[cam.flowNextIdx] : nullptr;
+    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight, nextCam);
     impl->model->schedulersStep(impl->currentStep);
     impl->model->afterTrain(impl->currentStep);
     msplat_commit();

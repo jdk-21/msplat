@@ -36,6 +36,19 @@ struct Camera {
     bool hasBgComposite = false;
     float bgComposite[3] = {};
 
+    // ── Flow splatting (Phase 3) ────────────────────────────────────────────
+    // Ground-truth optical flow from THIS frame to the next one in time, in
+    // pixels per frame interval. flowNextIdx indexes the train camera list the
+    // frontend holds; flowDt is the normalized time between the two frames.
+    std::string flowPath;
+    int flowNextIdx = -1;
+    float flowDt = 0.0f;
+    MTensor gpuFlow;   // (H, W, 3): u, v, valid — loaded on first use
+    bool hasFlow() const { return flowNextIdx >= 0 && !flowPath.empty(); }
+    // Loads flowPath into gpuFlow. Returns nullptr if the file is missing or its
+    // resolution does not match the (full-resolution) image.
+    MTensor* getGPUFlow();
+
     Image image;
     std::unordered_map<int, Image> imagePyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
@@ -71,5 +84,11 @@ struct InputData {
 // Auto-detect format and load dataset
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath = "",
                          bool whiteBackground = false);
+
+// Phase 3: link consecutive frames and their ground-truth flow files under
+// <datasetPath>/flow/<image stem>.flo. Call it on the TRAIN camera list after
+// the split — flowNextIdx indexes exactly that vector. Returns the number of
+// linked frames.
+int attachFlowToCameras(std::vector<Camera> &cams, const std::string &datasetPath);
 
 #endif

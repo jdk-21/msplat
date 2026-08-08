@@ -1689,23 +1689,35 @@ kernel void fused_adam_kernel(
 }
 
 // ============================================================================
-// 4D deformation (Phase 2) — time-varying means
+// 4D deformation (Phase 2/3) — time-varying means and rotation
 //
-// Each gaussian carries, on top of its canonical mean, a set of trajectory
-// coefficients. The mean at time t is
+// Each gaussian carries, on top of its canonical mean and quaternion, a set of
+// trajectory coefficients. At time t,
 //
 //   mu(t) = mu + SUM_n a_n * tau^n  +  SUM_l [ b_l*cos(2*pi*l*tau) + c_l*sin(2*pi*l*tau) ]
+//   q(t)  = q  + SUM_n e_n * tau^n  +  SUM_l [ f_l*cos(2*pi*l*tau) + g_l*sin(2*pi*l*tau) ]
 //
 // with tau = t - 0.5 (times are normalised to [0,1], so tau is centred on the
 // middle of the sequence). The polynomial part carries non-periodic drift, the
 // Fourier part carries oscillation; l=1 has exactly the period of the sequence.
+// The scales stay constant, as in the paper.
 //
-// Coefficients live in one (N, 3*B) tensor, B = n_poly + 2*n_fourier basis
-// functions, laid out as B consecutive float3 blocks per gaussian. Keeping them
-// in a single tensor means densification only has to carry one extra buffer.
+// All coefficients live in ONE (N, S) tensor per gaussian,
 //
-// With all coefficients zero, mu(t) == mu for every t, so a freshly initialised
-// 4D model is bit-identical to the static one — that is the regression test.
+//   S = 3*Bm + 4*Bq,   Bm = n_poly + 2*n_fourier,  Bq = q_poly + 2*q_fourier
+//
+// laid out as [ Bm float3 blocks | Bq float4 blocks ]. A single tensor means
+// densification only has to carry one extra buffer no matter how many 4D
+// parameter families we add — the alternative would blow the 31-buffer limit of
+// the densify kernels.
+//
+// With all coefficients zero, mu(t) == mu and q(t) == q for every t, so a
+// freshly initialised 4D model is bit-identical to the static one — that is the
+// regression test.
+//
+// Phase 3 reuses the same coefficients for the velocity field: v(t) = d mu/d t
+// is the analytic tau-derivative of the expansion above and costs no extra
+// parameters (see eval_deform_dbasis).
 // ============================================================================
 
 // Adam update helper — applies one Adam step to a single element.
@@ -1740,73 +1752,502 @@ inline int eval_deform_basis(float tau, int n_poly, int n_fourier,
     return b;
 }
 
-// mu(t) for every gaussian, written to a scratch buffer that is then fed to the
-// projection pass in place of the canonical means.
-kernel void deform_means_forward_kernel(
+// d(basis)/d(tau), in the same order as eval_deform_basis. This is the whole of
+// the Phase-3 velocity field: v(t) = SUM_b dbasis_b(tau) * coeff_b, i.e. the
+// velocity is the analytic time derivative of the trajectory and needs no
+// parameters of its own. d tau/d t = 1, so this is d/dt as well.
+inline int eval_deform_dbasis(float tau, int n_poly, int n_fourier,
+                              thread float *dbasis) {
+    int b = 0;
+    float tp = 1.0f;                    // tau^(n-1)
+    for (int n = 1; n <= n_poly; n++) {
+        dbasis[b++] = (float)n * tp;    // d(tau^n)/d tau
+        tp *= tau;
+    }
+    for (int l = 1; l <= n_fourier; l++) {
+        float w = 2.0f * M_PI_F * (float)l;
+        float a = w * tau;
+        dbasis[b++] = -w * sin(a);
+        dbasis[b++] =  w * cos(a);
+    }
+    return b;
+}
+
+// mu(t) and q(t) for every gaussian, written to scratch buffers that are then
+// fed to the projection pass in place of the canonical means/quats.
+// quats_t stays unnormalised — quat_to_rotmat normalises internally.
+kernel void deform_forward_kernel(
     constant int& num_points        [[buffer(0)]],
     constant float* means           [[buffer(1)]],
-    constant float* deform          [[buffer(2)]],
-    constant float& tau             [[buffer(3)]],
-    constant int& n_poly            [[buffer(4)]],
-    constant int& n_fourier         [[buffer(5)]],
+    constant float* quats           [[buffer(2)]],
+    constant float* deform          [[buffer(3)]],
+    constant float& tau             [[buffer(4)]],
+    constant int4& orders           [[buffer(5)]],  // n_poly, n_fourier, q_poly, q_fourier
     device float* means_t           [[buffer(6)]],
+    device float* quats_t           [[buffer(7)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points) return;
 
     float basis[MAX_DEFORM_BASIS];
-    int B = eval_deform_basis(tau, n_poly, n_fourier, basis);
+    int Bm = eval_deform_basis(tau, orders.x, orders.y, basis);
+    uint stride = (uint)(3 * Bm + 4 * (orders.z + 2 * orders.w));
+    uint base = idx * stride;
 
-    uint base = idx * (uint)(3 * B);
     float3 d = float3(0.0f);
-    for (int b = 0; b < B; b++) {
+    for (int b = 0; b < Bm; b++) {
         uint o = base + (uint)(3 * b);
         d += basis[b] * float3(deform[o], deform[o + 1], deform[o + 2]);
     }
-
     means_t[idx * 3 + 0] = means[idx * 3 + 0] + d.x;
     means_t[idx * 3 + 1] = means[idx * 3 + 1] + d.y;
     means_t[idx * 3 + 2] = means[idx * 3 + 2] + d.z;
+
+    int Bq = eval_deform_basis(tau, orders.z, orders.w, basis);
+    if (Bq == 0) return;               // rotation disabled: quats_t stays unused
+    float4 dq = float4(0.0f);
+    uint qbase = base + (uint)(3 * Bm);
+    for (int b = 0; b < Bq; b++) {
+        uint o = qbase + (uint)(4 * b);
+        dq += basis[b] * float4(deform[o], deform[o + 1], deform[o + 2], deform[o + 3]);
+    }
+    for (int c = 0; c < 4; c++) quats_t[idx * 4 + c] = quats[idx * 4 + c] + dq[c];
 }
 
-// Backward + Adam in one pass. d mu(t)/d a_b = basis_b * I, so the gradient of a
-// coefficient block is just v_mean3d scaled by its basis value — cheap enough to
-// recompute here rather than materialise an (N, 3*B) gradient buffer.
-// The canonical mean needs no special handling: d mu(t)/d mu = I, so the
-// existing Adam group already receives the right gradient.
-kernel void deform_means_backward_adam_kernel(
+// Backward + Adam in one pass for the whole coefficient block.
+//
+// d mu(t)/d a_b = basis_b * I, so the gradient of a coefficient block is just
+// v_mean3d scaled by its basis value — cheap enough to recompute here rather
+// than materialise an (N, S) gradient buffer. Same for the rotation blocks
+// against v_quat.
+//
+// The canonical mean and quaternion need no special handling: d mu(t)/d mu = I
+// and d q(t)/d q = I, so their existing Adam groups already received the right
+// gradient from the fused train step.
+//
+// Phase 3 feeds two more gradient sources through the same pass so that all
+// contributions land in ONE Adam step (a second Adam step on the same tensor
+// would corrupt the moment estimates):
+//   v_mu_extra  d L_flow / d mu(t)  — the camera-motion term of the rendered flow
+//   v_vel       d(L_flow + L_rigid) / d v(t) — chains in via dbasis, not basis
+// Both are optional; pass nullptr (bind a dummy and set the has_* flags to 0).
+kernel void deform_backward_adam_kernel(
     constant int& num_points        [[buffer(0)]],
     constant float* v_mean3d        [[buffer(1)]],
-    device float* deform            [[buffer(2)]],
-    device float* exp_avg           [[buffer(3)]],
-    device float* exp_avg_sq        [[buffer(4)]],
-    constant float& tau             [[buffer(5)]],
-    constant int& n_poly            [[buffer(6)]],
-    constant int& n_fourier         [[buffer(7)]],
-    constant float& step_size       [[buffer(8)]],
-    constant float& beta1           [[buffer(9)]],
-    constant float& beta2           [[buffer(10)]],
-    constant float& bc2_sqrt        [[buffer(11)]],
-    constant float& eps             [[buffer(12)]],
+    constant float* v_quat          [[buffer(2)]],
+    device float* deform            [[buffer(3)]],
+    device float* exp_avg           [[buffer(4)]],
+    device float* exp_avg_sq        [[buffer(5)]],
+    constant float& tau             [[buffer(6)]],
+    constant int4& orders           [[buffer(7)]],
+    constant float4& steps          [[buffer(8)]],  // step_m, step_q, beta1, beta2
+    constant float2& bc2_eps        [[buffer(9)]],  // bc2_sqrt, eps
+    constant float* v_mu_extra      [[buffer(10)]],
+    constant float* v_vel           [[buffer(11)]],
+    constant int2& has_extra        [[buffer(12)]], // has_mu_extra, has_vel
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points) return;
 
     float basis[MAX_DEFORM_BASIS];
-    int B = eval_deform_basis(tau, n_poly, n_fourier, basis);
+    float dbasis[MAX_DEFORM_BASIS];
+    int Bm = eval_deform_basis(tau, orders.x, orders.y, basis);
+    eval_deform_dbasis(tau, orders.x, orders.y, dbasis);
+    uint stride = (uint)(3 * Bm + 4 * (orders.z + 2 * orders.w));
+    uint base = idx * stride;
+
+    float beta1 = steps.z, beta2 = steps.w;
+    float bc2_sqrt = bc2_eps.x, eps = bc2_eps.y;
 
     float3 vg = float3(v_mean3d[idx * 3], v_mean3d[idx * 3 + 1], v_mean3d[idx * 3 + 2]);
-    uint base = idx * (uint)(3 * B);
-    for (int b = 0; b < B; b++) {
+    if (has_extra.x)
+        vg += float3(v_mu_extra[idx * 3], v_mu_extra[idx * 3 + 1], v_mu_extra[idx * 3 + 2]);
+    float3 vv = float3(0.0f);
+    if (has_extra.y)
+        vv = float3(v_vel[idx * 3], v_vel[idx * 3 + 1], v_vel[idx * 3 + 2]);
+
+    for (int b = 0; b < Bm; b++) {
         uint o = base + (uint)(3 * b);
-        float3 g = basis[b] * vg;
+        float3 g = basis[b] * vg + dbasis[b] * vv;
         adam_update_element(deform[o + 0], exp_avg[o + 0], exp_avg_sq[o + 0],
-                            g.x, step_size, beta1, beta2, bc2_sqrt, eps);
+                            g.x, steps.x, beta1, beta2, bc2_sqrt, eps);
         adam_update_element(deform[o + 1], exp_avg[o + 1], exp_avg_sq[o + 1],
-                            g.y, step_size, beta1, beta2, bc2_sqrt, eps);
+                            g.y, steps.x, beta1, beta2, bc2_sqrt, eps);
         adam_update_element(deform[o + 2], exp_avg[o + 2], exp_avg_sq[o + 2],
-                            g.z, step_size, beta1, beta2, bc2_sqrt, eps);
+                            g.z, steps.x, beta1, beta2, bc2_sqrt, eps);
     }
+
+    int Bq = eval_deform_basis(tau, orders.z, orders.w, basis);
+    if (Bq == 0) return;
+    float4 vq = float4(v_quat[idx * 4], v_quat[idx * 4 + 1],
+                       v_quat[idx * 4 + 2], v_quat[idx * 4 + 3]);
+    uint qbase = base + (uint)(3 * Bm);
+    for (int b = 0; b < Bq; b++) {
+        uint o = qbase + (uint)(4 * b);
+        float4 g = basis[b] * vq;
+        for (int c = 0; c < 4; c++)
+            adam_update_element(deform[o + c], exp_avg[o + c], exp_avg_sq[o + c],
+                                g[c], steps.y, beta1, beta2, bc2_sqrt, eps);
+    }
+}
+
+// ============================================================================
+// Phase 3 — Flow Splatting
+//
+// The velocity field is the analytic time derivative of the trajectory,
+// v_i(t) = d mu_i/dt, so it costs no parameters (eval_deform_dbasis).
+//
+// Rendering it as optical flow has to account for the camera moving between the
+// two frames the flow connects (paper Eq. 17). The 2D flow of gaussian i from
+// frame at time t (camera k_t) to the next frame (camera k_t1, dt apart) is
+//
+//   f_i = [ proj(mu_i(t), k_t1) - proj(mu_i(t), k_t) ]      camera motion
+//       + dt * J_proj(mu_i(t); k_t1) * v_i(t)               scene motion
+//
+// which is the first-order expansion of proj(mu_i(t+dt), k_t1) - proj(mu_i(t), k_t).
+// Note this is in PIXELS PER FRAME INTERVAL, i.e. directly comparable to what an
+// optical-flow estimator outputs — the paper's Eq. 17 divides the camera term by
+// dt instead and compares in pixels per unit time; the two differ by a constant
+// factor dt that would otherwise have to be applied to the ground truth.
+//
+// The flow image is then the same alpha compositing as colour (Eq. 18):
+//
+//   F(pixel) = SUM_i f_i * alpha_i * T_i
+//
+// Since alpha_i and T_i come from the very same sorted tile lists as the colour
+// pass, the flow render reuses tile_bins/packed_xy_opac/packed_conic verbatim and
+// only needs its own packed per-gaussian value buffer.
+// ============================================================================
+
+// Projected pixel position, and in the same pass the projection Jacobian applied
+// to a world-space vector — both read the same row-major 4x4 proj*view matrix.
+inline float2 proj_pix_and_jac(constant float* projmat, const float3 p, const float3 vec,
+                               const uint2 img_size, const float2 pp, thread float2& jvec) {
+    float u = projmat[0]*p.x + projmat[1]*p.y + projmat[2]*p.z + projmat[3];
+    float v = projmat[4]*p.x + projmat[5]*p.y + projmat[6]*p.z + projmat[7];
+    float w = projmat[12]*p.x + projmat[13]*p.y + projmat[14]*p.z + projmat[15];
+    float rw = 1.f / (w + 1e-6f);
+    float su = u * rw, sv = v * rw;
+    float du = projmat[0]*vec.x + projmat[1]*vec.y + projmat[2]*vec.z;
+    float dv = projmat[4]*vec.x + projmat[5]*vec.y + projmat[6]*vec.z;
+    float dw = projmat[12]*vec.x + projmat[13]*vec.y + projmat[14]*vec.z;
+    jvec = float2(0.5f * (float)img_size.x * (du - su * dw) * rw,
+                  0.5f * (float)img_size.y * (dv - sv * dw) * rw);
+    return float2(ndc2pix(su, (float)img_size.x, pp.x), ndc2pix(sv, (float)img_size.y, pp.y));
+}
+
+// J^T applied to a 2D pixel-space gradient — the transpose of the jvec branch above.
+inline float3 proj_jac_transpose(constant float* projmat, const float3 p, const float2 g,
+                                 const uint2 img_size) {
+    float u = projmat[0]*p.x + projmat[1]*p.y + projmat[2]*p.z + projmat[3];
+    float v = projmat[4]*p.x + projmat[5]*p.y + projmat[6]*p.z + projmat[7];
+    float w = projmat[12]*p.x + projmat[13]*p.y + projmat[14]*p.z + projmat[15];
+    float rw = 1.f / (w + 1e-6f);
+    float su = u * rw, sv = v * rw;
+    float3 r0 = float3(projmat[0], projmat[1], projmat[2]);
+    float3 r1 = float3(projmat[4], projmat[5], projmat[6]);
+    float3 r3 = float3(projmat[12], projmat[13], projmat[14]);
+    float a = 0.5f * (float)img_size.x * g.x * rw;
+    float b = 0.5f * (float)img_size.y * g.y * rw;
+    return a * (r0 - su * r3) + b * (r1 - sv * r3);
+}
+
+// v_i(t) = d mu_i/dt for every gaussian. Needed on its own for L_rigid, which
+// compares neighbouring 3D velocities without ever going to image space.
+kernel void velocity_field_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* deform          [[buffer(1)]],
+    constant float& tau             [[buffer(2)]],
+    constant int4& orders           [[buffer(3)]],
+    device float* velocity          [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+    float dbasis[MAX_DEFORM_BASIS];
+    int Bm = eval_deform_dbasis(tau, orders.x, orders.y, dbasis);
+    uint stride = (uint)(3 * Bm + 4 * (orders.z + 2 * orders.w));
+    uint base = idx * stride;
+    float3 v = float3(0.0f);
+    for (int b = 0; b < Bm; b++) {
+        uint o = base + (uint)(3 * b);
+        v += dbasis[b] * float3(deform[o], deform[o + 1], deform[o + 2]);
+    }
+    write_packed_float3(velocity, idx, v);
+}
+
+// Per-gaussian 2D flow (pixels per frame interval), see the block comment above.
+kernel void flow_project_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* means_t         [[buffer(1)]],
+    constant float* velocity        [[buffer(2)]],
+    constant int* radii             [[buffer(3)]],
+    constant float* projmat_cur     [[buffer(4)]],
+    constant float* projmat_next    [[buffer(5)]],
+    constant uint2& img_size        [[buffer(6)]],
+    constant float2& principal      [[buffer(7)]],
+    constant float& dt              [[buffer(8)]],
+    device float* flow2d            [[buffer(9)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+    if (radii[idx] <= 0) { write_packed_float2(flow2d, idx, float2(0.0f)); return; }
+
+    float3 p = read_packed_float3(means_t, idx);
+    float3 v = read_packed_float3(velocity, idx);
+
+    float2 jv_next, jv_dummy;
+    float2 px_next = proj_pix_and_jac(projmat_next, p, v, img_size, principal, jv_next);
+    float2 px_cur  = proj_pix_and_jac(projmat_cur,  p, float3(0.0f), img_size, principal, jv_dummy);
+
+    write_packed_float2(flow2d, idx, (px_next - px_cur) + dt * jv_next);
+}
+
+// Scatter per-gaussian flow into the sorted/packed order the rasterizer walks.
+// gaussian_ids is what bitonic_sort_per_tile_kernel already wrote.
+kernel void pack_flow_kernel(
+    constant uint& count            [[buffer(0)]],
+    constant int32_t* gaussian_ids  [[buffer(1)]],
+    constant float* flow2d          [[buffer(2)]],
+    device float* packed_flow       [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+    write_packed_float2(packed_flow, idx, read_packed_float2(flow2d, gaussian_ids[idx]));
+}
+
+// Alpha-composite the per-gaussian flow. Deliberately mirrors
+// nd_rasterize_forward_kernel's traversal and early-outs so that the alpha/T
+// sequence — and therefore final_Ts from the colour pass — is identical.
+kernel void flow_rasterize_forward_kernel(
+    constant uint3& tile_bounds     [[buffer(0)]],
+    constant uint3& img_size        [[buffer(1)]],
+    constant int* tile_bins         [[buffer(2)]],
+    constant float* packed_xy_opac  [[buffer(3)]],
+    constant float* packed_conic    [[buffer(4)]],
+    constant float* packed_flow     [[buffer(5)]],
+    device float* out_flow          [[buffer(6)]],
+    constant uint2& blockDim        [[buffer(7)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    float px = (float)j, py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float2 flow_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float2 pix_out = {0.f, 0.f};
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            flow_batch[tr] = read_packed_float2(packed_flow, idx);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (done || !inside) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) { done = true; break; }
+            pix_out = fma(flow_batch[t], alpha * T, pix_out);
+            T = next_T;
+        }
+    }
+
+    if (inside) {
+        out_flow[pix_id * 2 + 0] = pix_out.x;
+        out_flow[pix_id * 2 + 1] = pix_out.y;
+    }
+}
+
+// L1 flow loss, forward and backward in one pass.
+//
+// coverage = 1 - T_final from the colour pass; pixels the model leaves (almost)
+// empty carry no usable flow, and neither does a pixel the estimator flagged
+// invalid, so both are masked out. loss_sum accumulates |F - F_gt| * inv_n over
+// the unmasked pixels and v_flow_img receives d L_flow / d F.
+kernel void flow_loss_kernel(
+    constant uint2& img_size        [[buffer(0)]],
+    constant float* out_flow        [[buffer(1)]],
+    constant float* gt_flow         [[buffer(2)]],   // (H,W,3): u, v, valid
+    constant float* final_Ts        [[buffer(3)]],
+    constant float& inv_n           [[buffer(4)]],
+    constant float& grad_scale      [[buffer(5)]],   // gamma2 * inv_n
+    constant float& min_coverage    [[buffer(6)]],
+    device float* v_flow_img        [[buffer(7)]],
+    device atomic_float* loss_sum   [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    // No early return before the simd reduction below — simd_sum needs every
+    // lane of the simdgroup to take part.
+    float contrib = 0.f;
+    if (gid.x < img_size.x && gid.y < img_size.y) {
+        uint pix = gid.y * img_size.x + gid.x;
+        float valid = gt_flow[pix * 3 + 2];
+        float coverage = 1.0f - final_Ts[pix];
+        bool use = (valid > 0.5f) && (coverage >= min_coverage);
+        float2 d = float2(out_flow[pix * 2 + 0] - gt_flow[pix * 3 + 0],
+                          out_flow[pix * 2 + 1] - gt_flow[pix * 3 + 1]);
+        v_flow_img[pix * 2 + 0] = use ? sign(d.x) * grad_scale : 0.f;
+        v_flow_img[pix * 2 + 1] = use ? sign(d.y) * grad_scale : 0.f;
+        if (use) contrib = (abs(d.x) + abs(d.y)) * inv_n;
+    }
+    contrib = simd_sum(contrib);
+    if (simd_is_first() && contrib != 0.f)
+        atomic_fetch_add_explicit(loss_sum, contrib, memory_order_relaxed);
+}
+
+// Backward of the flow compositing. Only the per-gaussian flow VALUE gets a
+// gradient — the compositing weights alpha_i * T_i are treated as constants, so
+// L_flow shapes the trajectory and never the geometry or opacity. That keeps the
+// pass a single front-to-back walk (no reverse-order buffer, no v_alpha chain),
+// and it is the intended division of labour: L_color owns the geometry.
+kernel void flow_rasterize_backward_kernel(
+    constant uint3& tile_bounds     [[buffer(0)]],
+    constant uint3& img_size        [[buffer(1)]],
+    constant int* tile_bins         [[buffer(2)]],
+    constant int32_t* gaussian_ids  [[buffer(3)]],
+    constant float* packed_xy_opac  [[buffer(4)]],
+    constant float* packed_conic    [[buffer(5)]],
+    constant float* v_flow_img      [[buffer(6)]],
+    device atomic_float* v_flow2d   [[buffer(7)]],
+    constant uint2& blockDim        [[buffer(8)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int)img_size.y || j >= (int)img_size.x) return;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    int32_t pix_id = i * (int)img_size.x + j;
+
+    float2 v_out = float2(v_flow_img[pix_id * 2 + 0], v_flow_img[pix_id * 2 + 1]);
+    if (v_out.x == 0.f && v_out.y == 0.f) return;   // masked pixel
+
+    float px = (float)j, py = (float)i;
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    float T = 1.f;
+
+    for (int idx = range.x; idx < range.y; ++idx) {
+        const float3 xy_opac = read_packed_float3(packed_xy_opac, idx);
+        const float3 conic_local = read_packed_float3(packed_conic, idx);
+        const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+        const float sigma = fma(0.5f,
+            fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+            conic_local.y * delta.x * delta.y);
+        if (sigma < 0.f || sigma >= 5.55f) continue;
+        const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+        if (alpha < 1.f / 255.f) continue;
+        const float next_T = T * (1.f - alpha);
+        if (next_T <= 1e-4f) break;
+        const float vis = alpha * T;
+        int g = gaussian_ids[idx];
+        atomic_fetch_add_explicit(v_flow2d + 2 * g + 0, vis * v_out.x, memory_order_relaxed);
+        atomic_fetch_add_explicit(v_flow2d + 2 * g + 1, vis * v_out.y, memory_order_relaxed);
+        T = next_T;
+    }
+}
+
+// Chain the 2D flow gradient back to the two 3D quantities it came from:
+//   v_vel      += dt * J(k_t1)^T * g          (scene motion term)
+//   v_mu_extra += [J(k_t1) - J(k_t)]^T * g    (camera motion term)
+// The second-order d J / d mu term is dropped.
+// v_vel is accumulated, not overwritten: L_rigid writes into the same buffer.
+kernel void flow_project_backward_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* means_t         [[buffer(1)]],
+    constant int* radii             [[buffer(2)]],
+    constant float* projmat_cur     [[buffer(3)]],
+    constant float* projmat_next    [[buffer(4)]],
+    constant uint2& img_size        [[buffer(5)]],
+    constant float& dt              [[buffer(6)]],
+    constant float* v_flow2d        [[buffer(7)]],
+    device float* v_vel             [[buffer(8)]],
+    device float* v_mu_extra        [[buffer(9)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+    if (radii[idx] <= 0) return;
+    float2 g = read_packed_float2(v_flow2d, idx);
+    if (g.x == 0.f && g.y == 0.f) return;
+
+    float3 p = read_packed_float3(means_t, idx);
+    float3 jt_next = proj_jac_transpose(projmat_next, p, g, img_size);
+    float3 jt_cur  = proj_jac_transpose(projmat_cur,  p, g, img_size);
+
+    float3 vv = read_packed_float3(v_vel, idx) + dt * jt_next;
+    write_packed_float3(v_vel, idx, vv);
+    write_packed_float3(v_mu_extra, idx, read_packed_float3(v_mu_extra, idx) + (jt_next - jt_cur));
+}
+
+// L_rigid = 1/(k|G|) SUM_i SUM_{j in N_i} w_ij * ||v_i - v_j||,  w_ij = exp(-beta*||mu_i - mu_j||)
+//
+// Neighbours are the k nearest in the CANONICAL means, precomputed on the CPU
+// after every densification — recomputing a kNN graph per step would dominate the
+// step time, and the canonical neighbourhood is what "locally rigid" means here.
+// Both endpoints of every pair get their gradient, so the pass is exact for the
+// (asymmetric) neighbour set it is given.
+kernel void rigid_loss_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* means           [[buffer(1)]],
+    constant float* velocity        [[buffer(2)]],
+    constant int32_t* neighbors     [[buffer(3)]],   // (N, k)
+    constant int& k                 [[buffer(4)]],
+    constant float& beta            [[buffer(5)]],
+    constant float& weight          [[buffer(6)]],   // gamma3 / (k * N)
+    device atomic_float* v_vel      [[buffer(7)]],
+    device atomic_float* loss_sum   [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    float local_loss = 0.f;
+    if (idx < (uint)num_points) {
+        float3 mi = read_packed_float3(means, idx);
+        float3 vi = read_packed_float3(velocity, idx);
+        for (int n = 0; n < k; n++) {
+            int j = neighbors[idx * (uint)k + n];
+            if (j < 0 || j == (int)idx || j >= num_points) continue;
+            float3 dm = mi - read_packed_float3(means, j);
+            float w = exp(-beta * length(dm));
+            if (w < 1e-6f) continue;                  // negligible pair, skip the atomics
+            float3 dv = vi - read_packed_float3(velocity, j);
+            float nv = length(dv);
+            local_loss += w * nv;
+            if (nv < 1e-8f) continue;                 // ||.|| not differentiable at 0
+            float3 g = (weight * w / nv) * dv;
+            for (int c = 0; c < 3; c++) {
+                atomic_fetch_add_explicit(v_vel + 3 * idx + c,  g[c], memory_order_relaxed);
+                atomic_fetch_add_explicit(v_vel + 3 * (uint)j + c, -g[c], memory_order_relaxed);
+            }
+        }
+    }
+    local_loss = simd_sum(weight * local_loss);
+    if (simd_is_first() && local_loss != 0.f)
+        atomic_fetch_add_explicit(loss_sum, local_loss, memory_order_relaxed);
 }
 
 // ===== Fused Projection + SH Kernels =====

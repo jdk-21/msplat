@@ -74,6 +74,95 @@ MTensor& Camera::getGPUImage(int downscaleFactor) {
     return mtensorImageCache[downscaleFactor];
 }
 
+// ── Ground-truth optical flow (Phase 3) ─────────────────────────────────────
+//
+// Middlebury .flo: float magic 202021.25, int32 width, int32 height, then
+// width*height interleaved (u, v) float pairs. Values >= 1e9 mean "unknown",
+// which is how every estimator marks occlusions and out-of-frame pixels.
+// We expand that to (u, v, valid) so the loss kernel can mask in one read.
+
+MTensor* Camera::getGPUFlow() {
+    if (gpuFlow.defined()) return &gpuFlow;
+    if (flowPath.empty()) return nullptr;
+
+    std::ifstream f(flowPath, std::ios::binary);
+    if (!f.is_open()) {
+        fprintf(stderr, "Flow: cannot open %s\n", flowPath.c_str());
+        flowPath.clear();
+        return nullptr;
+    }
+    float magic = 0; int32_t w = 0, h = 0;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    f.read(reinterpret_cast<char*>(&w), sizeof(w));
+    f.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!f || magic != 202021.25f || w <= 0 || h <= 0) {
+        fprintf(stderr, "Flow: %s is not a Middlebury .flo file\n", flowPath.c_str());
+        flowPath.clear();
+        return nullptr;
+    }
+    if (w != width || h != height) {
+        fprintf(stderr, "Flow: %s is %dx%d but the image is %dx%d — ignoring\n",
+                flowPath.c_str(), w, h, width, height);
+        flowPath.clear();
+        return nullptr;
+    }
+
+    std::vector<float> uv((size_t)w * h * 2);
+    f.read(reinterpret_cast<char*>(uv.data()), (std::streamsize)(uv.size() * sizeof(float)));
+    if (!f) {
+        fprintf(stderr, "Flow: %s is truncated\n", flowPath.c_str());
+        flowPath.clear();
+        return nullptr;
+    }
+
+    gpuFlow = gpu_empty({h, w, 3}, DType::Float32);
+    float *dst = gpuFlow.data<float>();
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        float u = uv[i * 2], v = uv[i * 2 + 1];
+        bool ok = std::abs(u) < 1e9f && std::abs(v) < 1e9f &&
+                  std::isfinite(u) && std::isfinite(v);
+        dst[i * 3 + 0] = ok ? u : 0.0f;
+        dst[i * 3 + 1] = ok ? v : 0.0f;
+        dst[i * 3 + 2] = ok ? 1.0f : 0.0f;
+    }
+    return &gpuFlow;
+}
+
+// Links every camera to the next one in time and looks for its ground-truth
+// flow file under <dataset>/flow/<image stem>.flo. Returns the number of
+// cameras that ended up with a flow target.
+//
+// Call this on the TRAIN camera list, after the train/test split — flowNextIdx
+// indexes exactly the vector passed in, and a test frame must never be a flow
+// target or the held-out views leak into training.
+//
+// The pairing is by timestamp, not by file order: a dataset whose frames are
+// not stored in temporal order would otherwise get flow between unrelated
+// frames.
+int attachFlowToCameras(std::vector<Camera> &cams, const std::string &datasetPath) {
+    fs::path flowDir = fs::path(datasetPath) / "flow";
+    if (!fs::is_directory(flowDir)) return 0;
+
+    std::vector<int> order(cams.size());
+    for (size_t i = 0; i < cams.size(); i++) order[i] = (int)i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int a, int b) { return cams[a].time < cams[b].time; });
+
+    int linked = 0;
+    for (size_t k = 0; k + 1 < order.size(); k++) {
+        Camera &cur = cams[order[k]];
+        float dt = cams[order[k + 1]].time - cur.time;
+        if (dt <= 0.0f) continue;          // duplicate timestamps: no flow direction
+        fs::path p = flowDir / (fs::path(cur.filePath).stem().string() + ".flo");
+        if (!fs::exists(p)) continue;
+        cur.flowPath = p.string();
+        cur.flowNextIdx = order[k + 1];
+        cur.flowDt = dt;
+        linked++;
+    }
+    return linked;
+}
+
 // ── Scale & center ──────────────────────────────────────────────────────────
 
 void autoScaleAndCenter(InputData &data) {

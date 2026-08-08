@@ -38,6 +38,21 @@ struct Config {
     int deformNPoly = 0;        // polynomial order N
     int deformNFourier = 0;     // Fourier order L
     float deformLr = 0.001f;    // Adam lr for the trajectory coefficients
+    // Time-varying rotation. Paper uses N=3, L=3 with the scales left constant.
+    int deformRotNPoly = 0;
+    int deformRotNFourier = 0;
+    float deformRotLr = 0.0001f;
+
+    // ── Flow splatting (Phase 3) ────────────────────────────────────────────
+    // L = L_color + flowWeight * L_flow + rigidWeight * L_rigid.
+    // flow needs ground-truth optical flow in <dataset>/flow/<stem>.flo.
+    bool flow = false;
+    float flowWeight = 0.03f;        // gamma2
+    float flowMinCoverage = 0.1f;    // skip pixels the model leaves near-empty
+    bool rigid = false;
+    float rigidWeight = 0.5f;        // gamma3
+    float rigidBeta = 100.0f;        // w_ij = exp(-beta * ||mu_i - mu_j||)
+    int rigidK = 20;                 // neighbours per gaussian
     // Composite transparent source images over white instead of black. The
     // published D-NeRF protocol uses white; must match bgColor to evaluate fairly.
     bool whiteBackground = false;

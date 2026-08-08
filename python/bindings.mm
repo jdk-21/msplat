@@ -47,6 +47,17 @@ struct TrainingConfig {
     int deform_n_poly = 0;
     int deform_n_fourier = 0;
     float deform_lr = 0.001f;
+    int deform_rot_n_poly = 0;
+    int deform_rot_n_fourier = 0;
+    float deform_rot_lr = 0.0001f;
+    // Flow splatting (Phase 3)
+    bool flow = false;
+    float flow_weight = 0.03f;
+    float flow_min_coverage = 0.1f;
+    bool rigid = false;
+    float rigid_weight = 0.5f;
+    float rigid_beta = 100.0f;
+    int rigid_k = 20;
 };
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
@@ -55,6 +66,9 @@ struct TrainingStats {
     int iteration;
     int splat_count;
     float ms_per_step;
+    // Phase 3 — 0.0 unless the corresponding loss is enabled.
+    float flow_loss = 0.0f;
+    float rigid_loss = 0.0f;
 };
 
 // ── Dataset ─────────────────────────────────────────────────────────────────
@@ -64,9 +78,11 @@ public:
     InputData data;
     std::vector<Camera> train_cams;
     std::vector<Camera> test_cams;
+    std::string path;   // kept for the Phase-3 flow lookup under <path>/flow/
 
     Dataset(const std::string &path, float downscale_factor,
             bool eval_mode, int test_every, bool white_background)
+        : path(path)
     {
         data = inputDataFromX(path, "", white_background);
 
@@ -117,6 +133,29 @@ public:
     GaussianTrainer(Dataset &dataset, const TrainingConfig &cfg)
         : config(cfg), dataset_ptr(&dataset)
     {
+        DeformConfig dc;
+        dc.ord = {cfg.deform_n_poly, cfg.deform_n_fourier,
+                  cfg.deform_rot_n_poly, cfg.deform_rot_n_fourier};
+        dc.lr = cfg.deform_lr;
+        dc.rotLr = cfg.deform_rot_lr;
+        dc.flow = cfg.flow;
+        dc.flowWeight = cfg.flow_weight;
+        dc.flowMinCoverage = cfg.flow_min_coverage;
+        dc.rigid = cfg.rigid;
+        dc.rigidWeight = cfg.rigid_weight;
+        dc.rigidBeta = cfg.rigid_beta;
+        dc.rigidK = cfg.rigid_k;
+        if (dc.flow) {
+            int n = attachFlowToCameras(dataset.train_cams, dataset.path);
+            fprintf(stderr, "Flow: %d of %zu train frames have ground-truth flow\n",
+                    n, dataset.train_cams.size());
+            if (n == 0) {
+                fprintf(stderr, "Flow: nothing found under %s/flow — L_flow disabled\n",
+                        dataset.path.c_str());
+                dc.flow = false;
+            }
+        }
+
         model = std::make_unique<Model>(
             dataset.data,
             dataset.train_cams.size(),
@@ -127,7 +166,7 @@ public:
             cfg.stop_screen_size_at, cfg.split_screen_size,
             cfg.iterations, cfg.keep_crs,
             cfg.bg_color.data(),
-            cfg.deform_n_poly, cfg.deform_n_fourier, cfg.deform_lr
+            dc
         );
 
         cam_indices.resize(dataset.train_cams.size());
@@ -163,7 +202,9 @@ public:
 
             auto t0 = std::chrono::high_resolution_clock::now();
 
-            model->fullIteration(cam, current_step, gt, config.ssim_weight);
+            Camera *next_cam = cam.flowNextIdx >= 0
+                ? &dataset_ptr->train_cams[cam.flowNextIdx] : nullptr;
+            model->fullIteration(cam, current_step, gt, config.ssim_weight, next_cam);
             model->schedulersStep(current_step);
             model->afterTrain(current_step);
             msplat_commit();
@@ -175,6 +216,8 @@ public:
             stats.iteration = current_step;
             stats.splat_count = model->means.size(0);
             stats.ms_per_step = ms;
+            stats.flow_loss = model->lastFlowLoss;
+            stats.rigid_loss = model->lastRigidLoss;
             return stats;
         }
     }
@@ -274,6 +317,53 @@ public:
         return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
     }
 
+    // ── Phase 3 helpers ─────────────────────────────────────────────────────
+    // Both take a pose AND a time, which render_from_pose cannot express — the
+    // point of a 4D model is that the same viewpoint looks different over time.
+
+    Camera poseCamera(nb::ndarray<nb::numpy, float> cam_to_world, float time,
+                      int ref_cam_idx) {
+        if (cam_to_world.size() != 16)
+            throw std::runtime_error("cam_to_world must have 16 elements (4x4 matrix)");
+        if (ref_cam_idx < 0 || ref_cam_idx >= (int)dataset_ptr->train_cams.size())
+            throw std::runtime_error("ref_cam_idx out of range");
+        Camera cam = dataset_ptr->train_cams[ref_cam_idx];
+        memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
+        cam.time = time;
+        cam.cachedViewMat = MTensor();
+        cam.cachedProjViewMat = MTensor();
+        return cam;
+    }
+
+    static nb::object toNumpy(MTensor &t, int channels) {
+        int h = t.size(0), w = t.size(1);
+        float *buf = new float[(size_t)h * w * channels];
+        memcpy(buf, t.data_ptr(), (size_t)h * w * channels * sizeof(float));
+        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+        size_t shape[3] = {(size_t)h, (size_t)w, (size_t)channels};
+        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+    }
+
+    nb::object render_at(nb::ndarray<nb::numpy, float> cam_to_world, float time,
+                         int ref_cam_idx) {
+        Camera cam = poseCamera(cam_to_world, time, ref_cam_idx);
+        MTensor rgb = model->render(cam, current_step);
+        msplat_gpu_sync();
+        MTensor cpu = rgb.cpu();
+        return toNumpy(cpu, 3);
+    }
+
+    nb::object render_flow(nb::ndarray<nb::numpy, float> cam_to_world,
+                           nb::ndarray<nb::numpy, float> cam_to_world_next,
+                           float time, float dt, int ref_cam_idx) {
+        Camera cur = poseCamera(cam_to_world, time, ref_cam_idx);
+        Camera next = poseCamera(cam_to_world_next, time + dt, ref_cam_idx);
+        MTensor flow = model->renderFlow(cur, next, current_step, dt);
+        msplat_gpu_sync();
+        MTensor cpu = flow.cpu();
+        return toNumpy(cpu, 2);
+    }
+
     void export_ply(const std::string &path) {
         model->savePly(path, current_step);
     }
@@ -322,7 +412,10 @@ NB_MODULE(_core, m) {
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
                 std::vector<float> bg_color,
-                int deform_n_poly, int deform_n_fourier, float deform_lr) {
+                int deform_n_poly, int deform_n_fourier, float deform_lr,
+                int deform_rot_n_poly, int deform_rot_n_fourier, float deform_rot_lr,
+                bool flow, float flow_weight, float flow_min_coverage,
+                bool rigid, float rigid_weight, float rigid_beta, int rigid_k) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -347,6 +440,16 @@ NB_MODULE(_core, m) {
             cfg->deform_n_poly = deform_n_poly;
             cfg->deform_n_fourier = deform_n_fourier;
             cfg->deform_lr = deform_lr;
+            cfg->deform_rot_n_poly = deform_rot_n_poly;
+            cfg->deform_rot_n_fourier = deform_rot_n_fourier;
+            cfg->deform_rot_lr = deform_rot_lr;
+            cfg->flow = flow;
+            cfg->flow_weight = flow_weight;
+            cfg->flow_min_coverage = flow_min_coverage;
+            cfg->rigid = rigid;
+            cfg->rigid_weight = rigid_weight;
+            cfg->rigid_beta = rigid_beta;
+            cfg->rigid_k = rigid_k;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -368,10 +471,30 @@ NB_MODULE(_core, m) {
             "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
             "deform_n_poly"_a = 0,
             "deform_n_fourier"_a = 0,
-            "deform_lr"_a = 0.001f)
+            "deform_lr"_a = 0.001f,
+            "deform_rot_n_poly"_a = 0,
+            "deform_rot_n_fourier"_a = 0,
+            "deform_rot_lr"_a = 0.0001f,
+            "flow"_a = false,
+            "flow_weight"_a = 0.03f,
+            "flow_min_coverage"_a = 0.1f,
+            "rigid"_a = false,
+            "rigid_weight"_a = 0.5f,
+            "rigid_beta"_a = 100.0f,
+            "rigid_k"_a = 20)
         .def_rw("deform_n_poly", &TrainingConfig::deform_n_poly)
         .def_rw("deform_n_fourier", &TrainingConfig::deform_n_fourier)
         .def_rw("deform_lr", &TrainingConfig::deform_lr)
+        .def_rw("deform_rot_n_poly", &TrainingConfig::deform_rot_n_poly)
+        .def_rw("deform_rot_n_fourier", &TrainingConfig::deform_rot_n_fourier)
+        .def_rw("deform_rot_lr", &TrainingConfig::deform_rot_lr)
+        .def_rw("flow", &TrainingConfig::flow)
+        .def_rw("flow_weight", &TrainingConfig::flow_weight)
+        .def_rw("flow_min_coverage", &TrainingConfig::flow_min_coverage)
+        .def_rw("rigid", &TrainingConfig::rigid)
+        .def_rw("rigid_weight", &TrainingConfig::rigid_weight)
+        .def_rw("rigid_beta", &TrainingConfig::rigid_beta)
+        .def_rw("rigid_k", &TrainingConfig::rigid_k)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -398,6 +521,8 @@ NB_MODULE(_core, m) {
         .def_ro("iteration", &TrainingStats::iteration, "Current training iteration.")
         .def_ro("splat_count", &TrainingStats::splat_count, "Number of active Gaussians.")
         .def_ro("ms_per_step", &TrainingStats::ms_per_step, "Wall-clock time for this step in milliseconds.")
+        .def_ro("flow_loss", &TrainingStats::flow_loss, "Mean L1 optical-flow error in pixels (0 unless flow=True).")
+        .def_ro("rigid_loss", &TrainingStats::rigid_loss, "Weighted L_rigid (0 unless rigid=True).")
         .def("__repr__", [](const TrainingStats &s) {
             return "TrainingStats(iteration=" + std::to_string(s.iteration) +
                    ", splats=" + std::to_string(s.splat_count) +
@@ -437,6 +562,15 @@ NB_MODULE(_core, m) {
             "cam_to_world"_a, "ref_cam_idx"_a = 0,
             "Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).\n"
             "Uses intrinsics from ref_cam_idx. Returns numpy (H, W, 3) float32.")
+        .def("render_at", &GaussianTrainer::render_at,
+            "cam_to_world"_a, "time"_a, "ref_cam_idx"_a = 0,
+            "Render from an arbitrary pose AND normalized time in [0,1].\n"
+            "The 4D counterpart of render_from_pose. Returns numpy (H, W, 3) float32.")
+        .def("render_flow", &GaussianTrainer::render_flow,
+            "cam_to_world"_a, "cam_to_world_next"_a, "time"_a, "dt"_a, "ref_cam_idx"_a = 0,
+            "Render the optical flow this model predicts between two poses dt apart,\n"
+            "starting at normalized `time`. Returns numpy (H, W, 2) float32 in pixels\n"
+            "per frame interval — the same convention as the .flo ground truth.")
         .def("export_ply", &GaussianTrainer::export_ply, "path"_a,
             "Export the current Gaussians as a PLY file.")
         .def("export_ply_sequence", &GaussianTrainer::export_ply_sequence,

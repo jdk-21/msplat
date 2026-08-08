@@ -85,6 +85,37 @@ def main():
         deform_lr: float = 0.001
         """4D: Adam learning rate for the trajectory coefficients"""
 
+        deform_rot_n_poly: int = 0
+        """4D: polynomial order of the per-Gaussian rotation trajectory (paper: 3)"""
+
+        deform_rot_n_fourier: int = 0
+        """4D: Fourier order of the per-Gaussian rotation trajectory (paper: 3)"""
+
+        deform_rot_lr: float = 0.0001
+        """4D: Adam learning rate for the rotation coefficients"""
+
+        flow: bool = False
+        """Phase 3: render optical flow from the velocity field and apply L_flow.
+        Needs ground-truth flow in <input>/flow/<image stem>.flo (see tools/precompute_flow.py)."""
+
+        flow_weight: float = 0.03
+        """Phase 3: gamma2 in L = L_color + gamma2*L_flow + gamma3*L_rigid"""
+
+        flow_min_coverage: float = 0.1
+        """Phase 3: ignore flow pixels where the model accumulates less alpha than this"""
+
+        rigid: bool = False
+        """Phase 3: apply L_rigid — neighbouring Gaussians should move alike"""
+
+        rigid_weight: float = 0.5
+        """Phase 3: gamma3, the L_rigid weight"""
+
+        rigid_beta: float = 100.0
+        """Phase 3: neighbour weight w_ij = exp(-beta * ||mu_i - mu_j||), in world units"""
+
+        rigid_k: int = 20
+        """Phase 3: neighbours per Gaussian for L_rigid"""
+
         white_background: bool = False
         """Composite transparent source images over white (D-NeRF protocol)"""
 
@@ -128,7 +159,25 @@ def main():
         deform_n_poly=args.deform_n_poly,
         deform_n_fourier=args.deform_n_fourier,
         deform_lr=args.deform_lr,
+        deform_rot_n_poly=args.deform_rot_n_poly,
+        deform_rot_n_fourier=args.deform_rot_n_fourier,
+        deform_rot_lr=args.deform_rot_lr,
+        flow=args.flow,
+        flow_weight=args.flow_weight,
+        flow_min_coverage=args.flow_min_coverage,
+        rigid=args.rigid,
+        rigid_weight=args.rigid_weight,
+        rigid_beta=args.rigid_beta,
+        rigid_k=args.rigid_k,
     )
+
+    if (args.flow or args.rigid) and args.deform_n_poly == 0 and args.deform_n_fourier == 0:
+        print(
+            "Error: --flow/--rigid need a trajectory to supervise. "
+            "Add --deform-n-poly / --deform-n-fourier.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # The rasterizer's background has to match what transparent source pixels
     # were composited over, or the eval PSNR measures the mismatch.
@@ -151,11 +200,16 @@ def main():
     trainer = GaussianTrainer(dataset, config)
 
     def on_step(stats):
-        print(
+        line = (
             f"step={stats.iteration:>6}  "
             f"splats={stats.splat_count:>8,}  "
             f"ms={stats.ms_per_step:.1f}"
         )
+        if args.flow:
+            line += f"  flow_l1={stats.flow_loss:.3f}px"
+        if args.rigid:
+            line += f"  rigid={stats.rigid_loss:.5f}"
+        print(line)
 
     trainer.train(on_step, callback_every=100)
 

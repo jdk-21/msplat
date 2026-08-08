@@ -86,29 +86,92 @@ int msplat_densify(
     MTensor &deform_buf, int df_stride
 );
 
-// ── 4D deformation (Phase 2) ────────────────────────────────────────────────
+// ── 4D deformation (Phase 2/3) ──────────────────────────────────────────────
 // mu(t) = mu + SUM_n a_n*tau^n + SUM_l [b_l*cos(2*pi*l*tau) + c_l*sin(2*pi*l*tau)]
-// Coefficients are one (N, 3*(n_poly + 2*n_fourier)) tensor; tau is the frame
-// time recentred on the middle of the sequence.
+// q(t)  = q  + the same expansion with its own orders and 4-vector coefficients
+// All coefficients live in ONE (N, 3*Bm + 4*Bq) tensor; tau is the frame time
+// recentred on the middle of the sequence.
 
-// Writes mu(t) into means_t, to be passed to msplat_train_step/msplat_render in
-// place of the canonical means.
-void msplat_deform_means_forward(
-    int num_points, MTensor &means, MTensor &deform,
-    float tau, int n_poly, int n_fourier, MTensor &means_t
+// The four trajectory orders, passed around as a unit.
+struct DeformOrders {
+    int nPoly = 0, nFourier = 0;      // means trajectory
+    int qPoly = 0, qFourier = 0;      // rotation trajectory
+    int basisM() const { return nPoly + 2 * nFourier; }
+    int basisQ() const { return qPoly + 2 * qFourier; }
+    int stride() const { return 3 * basisM() + 4 * basisQ(); }
+    bool any() const { return stride() > 0; }
+    bool hasRot() const { return basisQ() > 0; }
+};
+
+// Writes mu(t) into means_t and q(t) into quats_t, to be passed to
+// msplat_train_step/msplat_render in place of the canonical means/quats.
+void msplat_deform_forward(
+    int num_points, MTensor &means, MTensor &quats, MTensor &deform,
+    float tau, DeformOrders ord, MTensor &means_t, MTensor &quats_t
 );
 
-// d L / d mu(t) from the last train step — the input to the coefficient chain rule.
+// d L / d mu(t) and d L / d q(t) from the last train step — the inputs to the
+// coefficient chain rule.
 MTensor& msplat_train_v_mean3d();
+MTensor& msplat_train_v_quat();
+// Projected radii from the last forward pass; <= 0 means the gaussian was culled.
+MTensor& msplat_forward_radii();
 
-// Chain-rules v_mean3d onto the coefficients and applies Adam to them in one pass.
-// The canonical means need no extra work: d mu(t)/d mu = I, so their existing
-// Adam group already got the correct gradient during the train step.
-void msplat_deform_means_backward_adam(
-    int num_points, MTensor &v_mean3d, MTensor &deform,
+// Chain-rules the gradients onto the coefficients and applies Adam in one pass.
+// The canonical means/quats need no extra work: d mu(t)/d mu = I and
+// d q(t)/d q = I, so their existing Adam groups already got the right gradient.
+// v_mu_extra and v_vel are the Phase-3 contributions (flow, rigidity); pass
+// undefined MTensors to leave them out. Everything lands in ONE Adam step —
+// a second step on the same tensor would corrupt the moment estimates.
+void msplat_deform_backward_adam(
+    int num_points, MTensor &v_mean3d, MTensor &v_quat, MTensor &deform,
     MTensor &exp_avg, MTensor &exp_avg_sq,
-    float tau, int n_poly, int n_fourier,
-    float step_size, float beta1, float beta2, float bc2_sqrt, float eps
+    float tau, DeformOrders ord,
+    float step_size_means, float step_size_rot,
+    float beta1, float beta2, float bc2_sqrt, float eps,
+    MTensor &v_mu_extra, MTensor &v_vel
+);
+
+// ── Phase 3: flow splatting ─────────────────────────────────────────────────
+
+// v(t) = d mu/dt for every gaussian — the analytic derivative of the trajectory.
+// Also clears v_vel/v_mu_extra (GPU-side): it is the first pass of the Phase-3
+// block, and L_flow and L_rigid both accumulate into them afterwards.
+void msplat_velocity_field(
+    int num_points, MTensor &deform, float tau, DeformOrders ord, MTensor &velocity,
+    MTensor &v_vel, MTensor &v_mu_extra
+);
+
+// Renders the velocity field as optical flow, compares it to gt_flow, and
+// accumulates the gradients into v_vel / v_mu_extra. Must run after
+// msplat_train_step for the same camera: it reuses that step's sorted tile
+// lists, packed gaussian data and final_Ts.
+//
+// gt_flow is (H, W, 3) — u, v in pixels per frame interval, plus a validity
+// flag. projmat_cur/next are the row-major 4x4 proj*view of the two frames.
+// Returns the (unweighted) mean L1 flow error for reporting.
+float msplat_flow_step(
+    int num_points, MTensor &means_t, MTensor &velocity, MTensor &radii,
+    MTensor &projmat_cur, MTensor &projmat_next,
+    unsigned img_height, unsigned img_width, float cx, float cy,
+    float dt, MTensor &gt_flow, float grad_weight, float min_coverage,
+    MTensor &v_vel, MTensor &v_mu_extra, MTensor &flow2d, MTensor &v_flow2d
+);
+
+// L_rigid over a precomputed kNN graph; accumulates into v_vel.
+// Returns the weighted loss for reporting.
+float msplat_rigid_step(
+    int num_points, MTensor &means, MTensor &velocity, MTensor &neighbors,
+    int k, float beta, float weight, MTensor &v_vel
+);
+
+// Renders the flow image only (no loss, no gradients) — used by the numerical
+// self-checks and by anyone who wants to look at the predicted flow.
+MTensor& msplat_flow_render(
+    int num_points, MTensor &means_t, MTensor &velocity, MTensor &radii,
+    MTensor &projmat_cur, MTensor &projmat_next,
+    unsigned img_height, unsigned img_width, float cx, float cy,
+    float dt, MTensor &flow2d
 );
 
 #endif
