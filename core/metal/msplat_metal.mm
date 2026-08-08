@@ -1664,6 +1664,7 @@ static void encode_flow_forward(
     ENC_BUF(enc, g_tcache.gaussian_ids, 1);
     ENC_BUF(enc, g_tcache.flow2d_scratch, 2);
     ENC_BUF(enc, g_tcache.packed_flow, 3);
+    ENC_SCALAR(enc, num_points, 4);
     dispatch_per_point(enc, ctx->pack_flow_kernel_cpso, (int)packed_count);
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 

@@ -2004,15 +2004,26 @@ kernel void flow_project_kernel(
 
 // Scatter per-gaussian flow into the sorted/packed order the rasterizer walks.
 // gaussian_ids is what bitonic_sort_per_tile_kernel already wrote.
+//
+// The dispatch covers the whole packed capacity, but the sort only fills the
+// slots the tiles actually used — the rest of gaussian_ids is uninitialised.
+// The rasterizer never reads those slots, so writing garbage into them is
+// harmless, but *reading* flow2d at an uninitialised index would be an
+// out-of-bounds read. Hence the explicit range check rather than trusting the
+// id. (This repo has already lost a day to an unchecked index in the sort
+// kernel; see "Blocker gefunden und behoben" above.)
 kernel void pack_flow_kernel(
     constant uint& count            [[buffer(0)]],
     constant int32_t* gaussian_ids  [[buffer(1)]],
     constant float* flow2d          [[buffer(2)]],
     device float* packed_flow       [[buffer(3)]],
+    constant int& num_points        [[buffer(4)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= count) return;
-    write_packed_float2(packed_flow, idx, read_packed_float2(flow2d, gaussian_ids[idx]));
+    int g = gaussian_ids[idx];
+    float2 f = (g >= 0 && g < num_points) ? read_packed_float2(flow2d, g) : float2(0.0f);
+    write_packed_float2(packed_flow, idx, f);
 }
 
 // Alpha-composite the per-gaussian flow. Deliberately mirrors
