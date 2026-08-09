@@ -49,7 +49,8 @@ static int64_t initNumPoints() {
 }
 
 static void loadSplit(const std::string &projectRoot, const std::string &file,
-                      bool isTest, bool whiteBackground, InputData &data) {
+                      bool isTest, bool whiteBackground, InputData &data,
+                      float &initExtent) {
     auto path = fs::path(projectRoot) / file;
     if (!fs::exists(path)) return;
 
@@ -60,12 +61,23 @@ static void loadSplit(const std::string &projectRoot, const std::string &file,
     if (angleX <= 0.0f)
         throw std::runtime_error("D-NeRF: missing or invalid camera_angle_x in " + file);
 
+    // Optional extensions used by our own multi-camera stage generator. D-NeRF
+    // itself ships none of them, so the defaults reproduce it exactly.
+    const int nomW = j.value("w", DNERF_NOMINAL_RES);
+    const int nomH = j.value("h", DNERF_NOMINAL_RES);
+    initExtent = j.value("init_extent", initExtent);
+
     for (auto &frame : j["frames"]) {
         Camera cam;
-        cam.width = cam.height = DNERF_NOMINAL_RES;
-        // Blender's camera_angle_x is the full horizontal FOV.
-        cam.fx = cam.fy = 0.5f * DNERF_NOMINAL_RES / std::tan(0.5f * angleX);
-        cam.cx = cam.cy = 0.5f * DNERF_NOMINAL_RES;
+        cam.width = nomW;
+        cam.height = nomH;
+        // Blender's camera_angle_x is the full horizontal FOV; pixels are square,
+        // so the vertical focal length is the same number, not one derived from
+        // the height.
+        cam.fx = cam.fy = 0.5f * nomW / std::tan(0.5f * angleX);
+        cam.cx = 0.5f * nomW;
+        cam.cy = 0.5f * nomH;
+        cam.camId = frame.value("cam_id", -1);
 
         // file_path is extension-less ("./train/r_000").
         std::string fp = frame["file_path"].get<std::string>();
@@ -89,8 +101,9 @@ static void loadSplit(const std::string &projectRoot, const std::string &file,
 
 InputData loaders::loadDnerf(const std::string &projectRoot, bool whiteBackground) {
     InputData data;
-    loadSplit(projectRoot, "transforms_train.json", false, whiteBackground, data);
-    loadSplit(projectRoot, "transforms_test.json", true, whiteBackground, data);
+    float initExtent = INIT_CUBE_HALF_EXTENT;
+    loadSplit(projectRoot, "transforms_train.json", false, whiteBackground, data, initExtent);
+    loadSplit(projectRoot, "transforms_test.json", true, whiteBackground, data, initExtent);
     if (data.cameras.empty())
         throw std::runtime_error("D-NeRF: no frames found in " + projectRoot);
     data.hasExplicitSplit = true;
@@ -98,7 +111,7 @@ InputData loaders::loadDnerf(const std::string &projectRoot, bool whiteBackgroun
     // No SfM points — seed a uniform random cloud around the object, the same
     // initialisation the published dynamic-Gaussian baselines use.
     std::mt19937 rng(42);
-    std::uniform_real_distribution<float> pos(-INIT_CUBE_HALF_EXTENT, INIT_CUBE_HALF_EXTENT);
+    std::uniform_real_distribution<float> pos(-initExtent, initExtent);
     std::uniform_int_distribution<int> col(0, 255);
     const int64_t nPts = initNumPoints();
     data.points.count = nPts;

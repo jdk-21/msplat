@@ -50,6 +50,9 @@ struct TrainingConfig {
     int deform_rot_n_poly = 0;
     int deform_rot_n_fourier = 0;
     float deform_rot_lr = 0.0001f;
+    // Temporal envelope (Phase 4)
+    bool deform_temporal = false;
+    float deform_temp_lr = 0.01f;
     // Flow splatting (Phase 3)
     bool flow = false;
     float flow_weight = 0.03f;
@@ -69,6 +72,8 @@ struct TrainingStats {
     // Phase 3 — 0.0 unless the corresponding loss is enabled.
     float flow_loss = 0.0f;
     float rigid_loss = 0.0f;
+    float temporal_mean = 1.0f;
+    float temporal_off_frac = 0.0f;
 };
 
 // ── Dataset ─────────────────────────────────────────────────────────────────
@@ -136,8 +141,10 @@ public:
         DeformConfig dc;
         dc.ord = {cfg.deform_n_poly, cfg.deform_n_fourier,
                   cfg.deform_rot_n_poly, cfg.deform_rot_n_fourier};
+        dc.ord.temporal = cfg.deform_temporal;
         dc.lr = cfg.deform_lr;
         dc.rotLr = cfg.deform_rot_lr;
+        dc.tempLr = cfg.deform_temp_lr;
         dc.flow = cfg.flow;
         dc.flowWeight = cfg.flow_weight;
         dc.flowMinCoverage = cfg.flow_min_coverage;
@@ -218,6 +225,8 @@ public:
             stats.ms_per_step = ms;
             stats.flow_loss = model->lastFlowLoss;
             stats.rigid_loss = model->lastRigidLoss;
+            stats.temporal_mean = model->lastTemporalMean;
+            stats.temporal_off_frac = model->lastTemporalOffFrac;
             return stats;
         }
     }
@@ -415,7 +424,8 @@ NB_MODULE(_core, m) {
                 int deform_n_poly, int deform_n_fourier, float deform_lr,
                 int deform_rot_n_poly, int deform_rot_n_fourier, float deform_rot_lr,
                 bool flow, float flow_weight, float flow_min_coverage,
-                bool rigid, float rigid_weight, float rigid_beta, int rigid_k) {
+                bool rigid, float rigid_weight, float rigid_beta, int rigid_k,
+                bool deform_temporal, float deform_temp_lr) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -450,6 +460,8 @@ NB_MODULE(_core, m) {
             cfg->rigid_weight = rigid_weight;
             cfg->rigid_beta = rigid_beta;
             cfg->rigid_k = rigid_k;
+            cfg->deform_temporal = deform_temporal;
+            cfg->deform_temp_lr = deform_temp_lr;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -481,13 +493,17 @@ NB_MODULE(_core, m) {
             "rigid"_a = false,
             "rigid_weight"_a = 0.5f,
             "rigid_beta"_a = 100.0f,
-            "rigid_k"_a = 20)
+            "rigid_k"_a = 20,
+            "deform_temporal"_a = false,
+            "deform_temp_lr"_a = 0.01f)
         .def_rw("deform_n_poly", &TrainingConfig::deform_n_poly)
         .def_rw("deform_n_fourier", &TrainingConfig::deform_n_fourier)
         .def_rw("deform_lr", &TrainingConfig::deform_lr)
         .def_rw("deform_rot_n_poly", &TrainingConfig::deform_rot_n_poly)
         .def_rw("deform_rot_n_fourier", &TrainingConfig::deform_rot_n_fourier)
         .def_rw("deform_rot_lr", &TrainingConfig::deform_rot_lr)
+        .def_rw("deform_temporal", &TrainingConfig::deform_temporal)
+        .def_rw("deform_temp_lr", &TrainingConfig::deform_temp_lr)
         .def_rw("flow", &TrainingConfig::flow)
         .def_rw("flow_weight", &TrainingConfig::flow_weight)
         .def_rw("flow_min_coverage", &TrainingConfig::flow_min_coverage)
@@ -523,6 +539,10 @@ NB_MODULE(_core, m) {
         .def_ro("ms_per_step", &TrainingStats::ms_per_step, "Wall-clock time for this step in milliseconds.")
         .def_ro("flow_loss", &TrainingStats::flow_loss, "Mean L1 optical-flow error in pixels (0 unless flow=True).")
         .def_ro("rigid_loss", &TrainingStats::rigid_loss, "Weighted L_rigid (0 unless rigid=True).")
+        .def_ro("temporal_mean", &TrainingStats::temporal_mean,
+                "Mean temporal envelope weight at the last timestamp (1 unless deform_temporal=True).")
+        .def_ro("temporal_off_frac", &TrainingStats::temporal_off_frac,
+                "Share of gaussians the envelope switched off (w < 0.01) at the last timestamp.")
         .def("__repr__", [](const TrainingStats &s) {
             return "TrainingStats(iteration=" + std::to_string(s.iteration) +
                    ", splats=" + std::to_string(s.splat_count) +

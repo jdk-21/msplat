@@ -94,6 +94,13 @@ def main():
         deform_rot_lr: float = 0.0001
         """4D: Adam learning rate for the rotation coefficients"""
 
+        deform_temporal: bool = False
+        """Phase 4: per-Gaussian temporal envelope on opacity — a Gaussian may exist
+        for only part of the sequence instead of having to explain every frame"""
+
+        deform_temp_lr: float = 0.01
+        """Phase 4: Adam learning rate for the envelope's centre and width"""
+
         flow: bool = False
         """Phase 3: render optical flow from the velocity field and apply L_flow.
         Needs ground-truth flow in <input>/flow/<image stem>.flo (see tools/precompute_flow.py)."""
@@ -169,6 +176,8 @@ def main():
         rigid_weight=args.rigid_weight,
         rigid_beta=args.rigid_beta,
         rigid_k=args.rigid_k,
+        deform_temporal=args.deform_temporal,
+        deform_temp_lr=args.deform_temp_lr,
     )
 
     if (args.flow or args.rigid) and args.deform_n_poly == 0 and args.deform_n_fourier == 0:
@@ -209,6 +218,9 @@ def main():
             line += f"  flow_l1={stats.flow_loss:.3f}px"
         if args.rigid:
             line += f"  rigid={stats.rigid_loss:.5f}"
+        if args.deform_temporal:
+            line += (f"  env={stats.temporal_mean:.3f}"
+                     f"  aus={stats.temporal_off_frac * 100:.1f}%")
         print(line)
 
     trainer.train(on_step, callback_every=100)

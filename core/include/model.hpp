@@ -25,8 +25,15 @@ struct DeformConfig {
   float rigidWeight = 0.5f;     // gamma3
   float rigidBeta = 100.0f;     // w_ij = exp(-beta * ||mu_i - mu_j||)
   int rigidK = 20;              // neighbours per gaussian
+
+  // ── Phase 4 ───────────────────────────────────────────────────────────────
+  // Per-gaussian temporal envelope on opacity. Switch it on via ord.temporal;
+  // tempLr is its own Adam step size, because centre and width live on a very
+  // different scale from the trajectory coefficients.
+  float tempLr = 0.0f;
   bool any4D() const { return ord.any(); }
   bool anyPhase3() const { return flow || rigid; }
+  bool temporal() const { return ord.temporal; }
 };
 
 struct Model{
@@ -108,6 +115,14 @@ struct Model{
   MTensor velocity, v_vel, v_mu_extra, flow2d, v_flow2d;
   MTensor neighbors;
   void rebuildNeighbors();
+  // Phase 4: w(tau) per gaussian and its gradient. Also per-gaussian scratch
+  // from refreshViews(). Undefined when the envelope is off, which is what
+  // switches the whole feature off downstream.
+  MTensor temporal_w, v_temporal_w;
+  // Mean envelope weight over the last evaluated timestamp, and the share of
+  // gaussians the envelope has effectively switched off (w < 0.01). The paper's
+  // efficiency claim lives in that second number.
+  float lastTemporalMean = 1.0f, lastTemporalOffFrac = 0.0f;
   float lastFlowLoss = 0.0f, lastRigidLoss = 0.0f;
   // Steps that actually ran a flow pass, and steps that had to skip it because
   // the progressive downscale did not match the ground-truth flow resolution.

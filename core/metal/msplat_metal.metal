@@ -1776,6 +1776,17 @@ inline int eval_deform_dbasis(float tau, int n_poly, int n_fourier,
 // mu(t) and q(t) for every gaussian, written to scratch buffers that are then
 // fed to the projection pass in place of the canonical means/quats.
 // quats_t stays unnormalised — quat_to_rotmat normalises internally.
+// The temporal envelope and its two derivatives. Kept in one place so forward
+// and backward cannot drift apart.
+//   k = softplus(s) >= 0      w = exp(-(tau - m)^2 * k)
+//   dw/dm = 2*(tau - m)*k*w
+//   dw/ds = -(tau - m)^2 * w * sigmoid(s)
+inline float temporal_envelope(float tau, float m, float s) {
+    float k = log(1.0f + exp(-abs(s))) + max(s, 0.0f);   // softplus, stabilisiert
+    float d = tau - m;
+    return exp(-d * d * k);
+}
+
 kernel void deform_forward_kernel(
     constant int& num_points        [[buffer(0)]],
     constant float* means           [[buffer(1)]],
@@ -1785,13 +1796,16 @@ kernel void deform_forward_kernel(
     constant int4& orders           [[buffer(5)]],  // n_poly, n_fourier, q_poly, q_fourier
     device float* means_t           [[buffer(6)]],
     device float* quats_t           [[buffer(7)]],
+    constant int& has_temporal      [[buffer(8)]],
+    device float* temporal_w        [[buffer(9)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points) return;
 
     float basis[MAX_DEFORM_BASIS];
     int Bm = eval_deform_basis(tau, orders.x, orders.y, basis);
-    uint stride = (uint)(3 * Bm + 4 * (orders.z + 2 * orders.w));
+    int Bq_n = orders.z + 2 * orders.w;
+    uint stride = (uint)(3 * Bm + 4 * Bq_n + 2 * has_temporal);
     uint base = idx * stride;
 
     float3 d = float3(0.0f);
@@ -1803,6 +1817,11 @@ kernel void deform_forward_kernel(
     means_t[idx * 3 + 1] = means[idx * 3 + 1] + d.y;
     means_t[idx * 3 + 2] = means[idx * 3 + 2] + d.z;
 
+    if (has_temporal) {
+        uint o = base + (uint)(3 * Bm + 4 * Bq_n);
+        temporal_w[idx] = temporal_envelope(tau, deform[o], deform[o + 1]);
+    }
+
     int Bq = eval_deform_basis(tau, orders.z, orders.w, basis);
     if (Bq == 0) return;               // rotation disabled: quats_t stays unused
     float4 dq = float4(0.0f);
@@ -1812,6 +1831,46 @@ kernel void deform_forward_kernel(
         dq += basis[b] * float4(deform[o], deform[o + 1], deform[o + 2], deform[o + 3]);
     }
     for (int c = 0; c < 4; c++) quats_t[idx * 4 + c] = quats[idx * 4 + c] + dq[c];
+}
+
+// Extracts d L / d w from the opacity gradient the rasterizer already produced.
+//
+// The rasterizer backward accumulates  v_opacity = SUM_pixels -v_sigma*(1 - p)
+// with p = the packed (envelope-scaled) opacity. Because the envelope is a
+// factor that is constant per gaussian, (1 - p) factors straight out of that
+// sum, so the raw sum S = SUM -v_sigma comes back exactly by dividing it out —
+// and from S both gradients follow in closed form:
+//
+//   p = sigmoid(raw) * w        S = v_opacity / (1 - p)
+//   d L / d w   = S / w                    <- what this kernel produces
+//   d L / d raw = S * (1 - sigmoid(raw))   <- see the note below
+//
+// Doing it here instead of inside the rasterizer keeps the hot, warp-reduced
+// compositing loop untouched.
+//
+// Note on the opacity gradient: msplat applies Adam to opacity *inside* the
+// fused train step, so by the time this runs, the update has already happened
+// with -v_sigma*(1 - p) instead of the exact -v_sigma*(1 - s). The two differ
+// only by the per-gaussian factor (1 - p)/(1 - s) >= 1 — same sign, and a
+// quasi-constant rescaling of a single parameter is precisely what Adam's
+// per-parameter second-moment normalisation absorbs. Correcting it properly
+// would mean unfusing the opacity Adam from the train step, which costs a
+// dispatch on every iteration of every run, 4D or not. The envelope's own
+// gradient, which is the new and unproven one, stays exact.
+kernel void temporal_opacity_fixup_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* opacities       [[buffer(1)]],   // raw logits
+    constant float* temporal_w      [[buffer(2)]],
+    constant float* v_opacity       [[buffer(3)]],
+    device float* v_temporal_w      [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+    float s = 1.0f / (1.0f + exp(-opacities[idx]));
+    float w = temporal_w[idx];
+    float p = s * w;
+    float S = v_opacity[idx] / max(1.0f - p, 1e-6f);
+    v_temporal_w[idx] = S / max(w, 1e-6f);
 }
 
 // Backward + Adam in one pass for the whole coefficient block.
@@ -1845,6 +1904,8 @@ kernel void deform_backward_adam_kernel(
     constant float* v_mu_extra      [[buffer(10)]],
     constant float* v_vel           [[buffer(11)]],
     constant int2& has_extra        [[buffer(12)]], // has_mu_extra, has_vel
+    constant float* v_temporal_w    [[buffer(13)]],
+    constant float2& temporal_cfg   [[buffer(14)]], // has_temporal, step_t
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points) return;
@@ -1853,8 +1914,28 @@ kernel void deform_backward_adam_kernel(
     float dbasis[MAX_DEFORM_BASIS];
     int Bm = eval_deform_basis(tau, orders.x, orders.y, basis);
     eval_deform_dbasis(tau, orders.x, orders.y, dbasis);
-    uint stride = (uint)(3 * Bm + 4 * (orders.z + 2 * orders.w));
+    int has_temporal = (int)temporal_cfg.x;
+    int Bq_n = orders.z + 2 * orders.w;
+    uint stride = (uint)(3 * Bm + 4 * Bq_n + 2 * has_temporal);
     uint base = idx * stride;
+
+    // Envelope zuerst: der Rest der Funktion kehrt bei abgeschalteter Rotation
+    // vorzeitig zurück, und die Hüllkurve hängt an keinem von beiden.
+    if (has_temporal) {
+        uint o = base + (uint)(3 * Bm + 4 * Bq_n);
+        float m = deform[o], s = deform[o + 1];
+        float k = log(1.0f + exp(-abs(s))) + max(s, 0.0f);
+        float d = tau - m;
+        float w = exp(-d * d * k);
+        float vw = v_temporal_w[idx];
+        float sig_s = 1.0f / (1.0f + exp(-s));
+        float g_m = vw * 2.0f * d * k * w;
+        float g_s = vw * (-d * d * w * sig_s);
+        adam_update_element(deform[o], exp_avg[o], exp_avg_sq[o],
+                            g_m, temporal_cfg.y, steps.z, steps.w, bc2_eps.x, bc2_eps.y);
+        adam_update_element(deform[o + 1], exp_avg[o + 1], exp_avg_sq[o + 1],
+                            g_s, temporal_cfg.y, steps.z, steps.w, bc2_eps.x, bc2_eps.y);
+    }
 
     float beta1 = steps.z, beta2 = steps.w;
     float bc2_sqrt = bc2_eps.x, eps = bc2_eps.y;
@@ -2559,6 +2640,8 @@ kernel void pack_sorted_gaussians_kernel(
     constant uint& N                 [[buffer(8)]],
     constant int32_t* cum_tiles_hit  [[buffer(9)]],
     constant uint& num_points        [[buffer(10)]],
+    constant float* temporal_w       [[buffer(11)]],
+    constant int& has_temporal       [[buffer(12)]],
     uint idx [[thread_position_in_grid]]
 ) {
     uint actual_N = min(N, (uint)cum_tiles_hit[num_points - 1]);
@@ -2566,6 +2649,7 @@ kernel void pack_sorted_gaussians_kernel(
     int32_t g_id = gaussian_ids_sorted[idx];
     float2 xy = read_packed_float2(xys, g_id);
     float opac = 1.f / (1.f + exp(-opacities[g_id]));
+    if (has_temporal) opac *= temporal_w[g_id];
     float3 conic = read_packed_float3(conics, g_id);
     float3 rgb = read_packed_float3(colors, g_id);
     write_packed_float3(packed_xy_opac, idx, {xy.x, xy.y, opac});
@@ -2638,6 +2722,10 @@ kernel void bitonic_sort_per_tile_kernel(
     device int* tile_bins               [[buffer(12)]],
     constant uint& out_capacity         [[buffer(13)]],
     device atomic_uint* overflow_flag   [[buffer(14)]],
+    // Phase 4: per-gaussian temporal envelope, folded into the packed opacity so
+    // the compositing loops never learn about it.
+    constant float* temporal_w          [[buffer(15)]],
+    constant int& has_temporal          [[buffer(16)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
@@ -2706,6 +2794,7 @@ kernel void bitonic_sort_per_tile_kernel(
         gaussian_ids_out[global_idx] = g_id;
         float2 xy = read_packed_float2(xys, g_id);
         float opac = 1.f / (1.f + exp(-opacities[g_id]));
+        if (has_temporal) opac *= temporal_w[g_id];
         write_packed_float3(packed_xy_opac, global_idx, {xy.x, xy.y, opac});
         write_packed_float3(packed_conic, global_idx, read_packed_float3(conics, g_id));
         write_packed_float3(packed_rgb, global_idx, read_packed_float3(colors, g_id));

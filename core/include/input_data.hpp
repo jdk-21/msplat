@@ -31,6 +31,11 @@ struct Camera {
     // Set by loaders that carry their own train/test split (e.g. D-NeRF)
     // instead of relying on the every-Nth-image rule.
     bool isTest = false;
+    // Physical camera this frame came from, for multi-camera rigs where the same
+    // camera contributes many timestamps. -1 = the loader does not know, and
+    // consumers fall back to matching extrinsics. Phase 3 needs it to pair flow
+    // within a camera instead of across the rig.
+    int camId = -1;
     // Background to composite RGBA source images over. Synthetic datasets ship
     // transparent PNGs; without this the alpha is dropped and holes read black.
     bool hasBgComposite = false;

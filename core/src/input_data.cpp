@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <map>
 #include <random>
 #include <cmath>
 
@@ -128,37 +129,83 @@ MTensor* Camera::getGPUFlow() {
     return &gpuFlow;
 }
 
-// Links every camera to the next one in time and looks for its ground-truth
-// flow file under <dataset>/flow/<image stem>.flo. Returns the number of
-// cameras that ended up with a flow target.
+// Identifies the physical camera a frame came from. Loaders that know it (a
+// multi-camera rig labels its frames) set Camera::camId; otherwise we fall back
+// to the extrinsics, because a camera bolted to a stage repeats bit-identical
+// poses every timestep. The quantisation absorbs float noise from loaders that
+// round-trip the pose through text.
+static std::string rigKey(const Camera &c) {
+    if (c.camId >= 0) return "id:" + std::to_string(c.camId);
+    std::string k = "p:";
+    for (int i = 0; i < 12; i++) {
+        k += std::to_string((long long)std::llround(c.camToWorld[i] * 1e5f));
+        k += ',';
+    }
+    return k;
+}
+
+// Ground-truth flow lives under <dataset>/flow/. A rig stores its frames in
+// per-camera subdirectories, and then the image stems collide across cameras
+// (cam00/0007.png and cam01/0007.png), so mirror the image tree first and only
+// fall back to the flat layout a monocular capture uses.
+static fs::path findFlowFile(const fs::path &flowDir, const std::string &imagePath) {
+    fs::path img(imagePath);
+    std::string stem = img.stem().string();
+    if (img.has_parent_path()) {
+        fs::path nested = flowDir / img.parent_path().filename() / (stem + ".flo");
+        if (fs::exists(nested)) return nested;
+    }
+    fs::path flat = flowDir / (stem + ".flo");
+    if (fs::exists(flat)) return flat;
+    return {};
+}
+
+// Links every camera to the next frame FROM THE SAME CAMERA and looks for its
+// ground-truth flow file under <dataset>/flow/. Returns the number of cameras
+// that ended up with a flow target.
 //
 // Call this on the TRAIN camera list, after the train/test split — flowNextIdx
 // indexes exactly the vector passed in, and a test frame must never be a flow
 // target or the held-out views leak into training.
 //
-// The pairing is by timestamp, not by file order: a dataset whose frames are
-// not stored in temporal order would otherwise get flow between unrelated
-// frames.
+// Pairing is per camera, not globally by timestamp. Sorting the whole train set
+// by time is right for monocular capture but wrong for a rig: there the sorted
+// order is [cam0@t0 ... camN@t0, cam0@t1 ...], the within-timestep pairs drop
+// out as dt == 0, and the one surviving pair per timestep (camN@t0 -> cam0@t1)
+// spans two different cameras. The flow loss would then be asked to explain a
+// stereo baseline as scene motion.
 int attachFlowToCameras(std::vector<Camera> &cams, const std::string &datasetPath) {
     fs::path flowDir = fs::path(datasetPath) / "flow";
     if (!fs::is_directory(flowDir)) return 0;
 
-    std::vector<int> order(cams.size());
-    for (size_t i = 0; i < cams.size(); i++) order[i] = (int)i;
-    std::stable_sort(order.begin(), order.end(),
-                     [&](int a, int b) { return cams[a].time < cams[b].time; });
+    std::map<std::string, std::vector<int>> groups;
+    for (size_t i = 0; i < cams.size(); i++) groups[rigKey(cams[i])].push_back((int)i);
+
+    // Every frame its own pose means a single camera that moved: one chain over
+    // the whole set. Otherwise each group is a camera and gets its own chain.
+    std::vector<std::vector<int>> chains;
+    if (groups.size() == cams.size()) {
+        chains.emplace_back(cams.size());
+        for (size_t i = 0; i < cams.size(); i++) chains[0][i] = (int)i;
+    } else {
+        for (auto &kv : groups) chains.push_back(std::move(kv.second));
+    }
 
     int linked = 0;
-    for (size_t k = 0; k + 1 < order.size(); k++) {
-        Camera &cur = cams[order[k]];
-        float dt = cams[order[k + 1]].time - cur.time;
-        if (dt <= 0.0f) continue;          // duplicate timestamps: no flow direction
-        fs::path p = flowDir / (fs::path(cur.filePath).stem().string() + ".flo");
-        if (!fs::exists(p)) continue;
-        cur.flowPath = p.string();
-        cur.flowNextIdx = order[k + 1];
-        cur.flowDt = dt;
-        linked++;
+    for (auto &chain : chains) {
+        std::stable_sort(chain.begin(), chain.end(),
+                         [&](int a, int b) { return cams[a].time < cams[b].time; });
+        for (size_t k = 0; k + 1 < chain.size(); k++) {
+            Camera &cur = cams[chain[k]];
+            float dt = cams[chain[k + 1]].time - cur.time;
+            if (dt <= 0.0f) continue;      // duplicate timestamps: no flow direction
+            fs::path p = findFlowFile(flowDir, cur.filePath);
+            if (p.empty()) continue;
+            cur.flowPath = p.string();
+            cur.flowNextIdx = chain[k + 1];
+            cur.flowDt = dt;
+            linked++;
+        }
     }
     return linked;
 }

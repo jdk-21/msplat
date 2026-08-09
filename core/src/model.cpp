@@ -202,6 +202,7 @@ void Model::releaseOptimizers(){
     deform_buf.reset(); means_t.reset(); quats_t.reset();
     velocity.reset(); v_vel.reset(); v_mu_extra.reset();
     flow2d.reset(); v_flow2d.reset(); neighbors.reset();
+    temporal_w.reset(); v_temporal_w.reset();
     densify_split_flag.reset(); densify_dup_flag.reset();
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
@@ -234,6 +235,10 @@ void Model::refreshViews(){
         if (dcfg.flow) {
             flow2d = gpu_zeros({(int64_t)num_active, 2}, DType::Float32);
             v_flow2d = gpu_zeros({(int64_t)num_active, 2}, DType::Float32);
+        }
+        if (dcfg.temporal()) {
+            temporal_w = gpu_zeros({(int64_t)num_active, 1}, DType::Float32);
+            v_temporal_w = gpu_zeros({(int64_t)num_active, 1}, DType::Float32);
         }
     }
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
@@ -422,7 +427,9 @@ int Model::loadPly(const std::string &filename){
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
 // v2: the 4D block stores four trajectory orders (means + rotation) instead of
 // two, and `deform` holds the combined means/rotation coefficients.
-static constexpr uint32_t CKPT_VERSION = 2;
+// v3: a fifth order word carries the Phase-4 temporal-envelope flag, which
+// changes the stride of `deform` and so cannot be inferred from the file.
+static constexpr uint32_t CKPT_VERSION = 3;
 
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
@@ -488,8 +495,9 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     uint32_t has4D = is4D() ? 1u : 0u;
     f.write(reinterpret_cast<const char*>(&has4D), sizeof(has4D));
     if (has4D) {
-        uint32_t ord[4] = {(uint32_t)dcfg.ord.nPoly, (uint32_t)dcfg.ord.nFourier,
-                           (uint32_t)dcfg.ord.qPoly, (uint32_t)dcfg.ord.qFourier};
+        uint32_t ord[5] = {(uint32_t)dcfg.ord.nPoly, (uint32_t)dcfg.ord.nFourier,
+                           (uint32_t)dcfg.ord.qPoly, (uint32_t)dcfg.ord.qFourier,
+                           dcfg.ord.temporal ? 1u : 0u};
         f.write(reinterpret_cast<const char*>(ord), sizeof(ord));
         writeTensor(f, deform);
         writeTensor(f, adam_exp_avg[6]);
@@ -542,12 +550,13 @@ int Model::loadCheckpoint(const std::string &filename) {
     uint32_t has4D = 0;
     f.read(reinterpret_cast<char*>(&has4D), sizeof(has4D));
     if (f && has4D) {
-        uint32_t ord[4] = {};
+        uint32_t ord[5] = {};
         f.read(reinterpret_cast<char*>(ord), sizeof(ord));
         dcfg.ord.nPoly = (int)ord[0];
         dcfg.ord.nFourier = (int)ord[1];
         dcfg.ord.qPoly = (int)ord[2];
         dcfg.ord.qFourier = (int)ord[3];
+        dcfg.ord.temporal = ord[4] != 0;
         deform = readTensor(f);
         adam_exp_avg[6] = readTensor(f);
         adam_exp_avg_sq[6] = readTensor(f);
@@ -664,7 +673,7 @@ static inline float deformTau(float time) { return time - 0.5f; }
 MTensor& Model::deformedMeans(float time) {
     if (!is4D()) return means;
     msplat_deform_forward(means.size(0), means, quats, deform,
-                          deformTau(time), dcfg.ord, means_t, quats_t);
+                          deformTau(time), dcfg.ord, means_t, quats_t, temporal_w);
     return means_t;
 }
 
@@ -830,6 +839,29 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
                 dcfg.rigidWeight / (float)(k * numPoints), v_vel);
         }
 
+        // Phase 4: the envelope's gradient has to be extracted from the opacity
+        // gradient BEFORE the deform backward consumes it, and after the train
+        // step produced it.
+        if (dcfg.temporal() && temporal_w.defined()) {
+            msplat_temporal_opacity_fixup(numPoints, opacities, temporal_w,
+                                          msplat_train_v_opacity(), v_temporal_w);
+            // Reporting only, on the cadence the CLI prints at: how selective the
+            // envelope has become. offFrac is the paper's efficiency claim —
+            // the share of gaussians this timestamp does not have to composite.
+            if (step % 100 == 0) {
+                msplat_gpu_sync();
+                const float *w = temporal_w.data<float>();
+                double sum = 0.0;
+                long off = 0;
+                for (int i = 0; i < numPoints; i++) {
+                    sum += w[i];
+                    if (w[i] < 0.01f) off++;
+                }
+                lastTemporalMean = (float)(sum / std::max(numPoints, 1));
+                lastTemporalOffFrac = (float)off / (float)std::max(numPoints, 1);
+            }
+        }
+
         msplat_deform_backward_adam(
             numPoints, msplat_train_v_mean3d(), msplat_train_v_quat(), deform,
             adam_exp_avg[6], adam_exp_avg_sq[6],
@@ -837,7 +869,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
             adam_lr[6] / bc1, dcfg.rotLr / bc1,
             adam_beta1, adam_beta2, std::sqrt(bc2), adam_eps,
             ranPhase3 ? v_mu_extra : noTensor,
-            ranPhase3 ? v_vel : noTensor);
+            ranPhase3 ? v_vel : noTensor,
+            dcfg.temporal() ? v_temporal_w : noTensor, dcfg.tempLr / bc1);
     }
 
     radii = r;

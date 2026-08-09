@@ -96,19 +96,49 @@ int msplat_densify(
 struct DeformOrders {
     int nPoly = 0, nFourier = 0;      // means trajectory
     int qPoly = 0, qFourier = 0;      // rotation trajectory
+    // Per-gaussian temporal envelope (Phase 4): two more scalars per gaussian,
+    // a centre and a width, appended after the trajectory coefficients.
+    //   w(tau) = exp(-(tau - m)^2 * softplus(s))
+    // The envelope multiplies opacity, so a gaussian can be present for only
+    // part of the sequence instead of having to explain every frame. Zero is a
+    // usable initialisation by construction: tau is already centred on the
+    // middle of the take, so m = 0 is the middle, and softplus(0) = 0.69 gives a
+    // wide, nearly flat envelope whose gradient is alive from the first step.
+    bool temporal = false;
     int basisM() const { return nPoly + 2 * nFourier; }
     int basisQ() const { return qPoly + 2 * qFourier; }
-    int stride() const { return 3 * basisM() + 4 * basisQ(); }
+    int nTemporal() const { return temporal ? 2 : 0; }
+    int stride() const { return 3 * basisM() + 4 * basisQ() + nTemporal(); }
     bool any() const { return stride() > 0; }
     bool hasRot() const { return basisQ() > 0; }
+    // Offset of the envelope pair inside one gaussian's block.
+    int temporalOffset() const { return 3 * basisM() + 4 * basisQ(); }
 };
 
 // Writes mu(t) into means_t and q(t) into quats_t, to be passed to
 // msplat_train_step/msplat_render in place of the canonical means/quats.
+// Also computes the temporal envelope into temporal_w and publishes it, so that
+// every subsequent render/train step for this timestamp folds it into opacity.
+// Pass an undefined temporal_w (or ord.temporal == false) to switch it off.
 void msplat_deform_forward(
     int num_points, MTensor &means, MTensor &quats, MTensor &deform,
-    float tau, DeformOrders ord, MTensor &means_t, MTensor &quats_t
+    float tau, DeformOrders ord, MTensor &means_t, MTensor &quats_t,
+    MTensor &temporal_w
 );
+
+// Currently published envelope, or nullptr. Only for assertions/debugging.
+MTensor *msplat_temporal_envelope();
+
+// Extracts d L/d w from the opacity gradient the rasterizer produced under an
+// active envelope. Run it after the train step and before the deform backward
+// that consumes v_temporal_w.
+void msplat_temporal_opacity_fixup(
+    int num_points, MTensor &opacities, MTensor &temporal_w,
+    MTensor &v_opacity, MTensor &v_temporal_w
+);
+
+// d L / d(raw opacity) from the last train step — needed by the fixup above.
+MTensor& msplat_train_v_opacity();
 
 // d L / d mu(t) and d L / d q(t) from the last train step — the inputs to the
 // coefficient chain rule.
@@ -129,7 +159,8 @@ void msplat_deform_backward_adam(
     float tau, DeformOrders ord,
     float step_size_means, float step_size_rot,
     float beta1, float beta2, float bc2_sqrt, float eps,
-    MTensor &v_mu_extra, MTensor &v_vel
+    MTensor &v_mu_extra, MTensor &v_vel,
+    MTensor &v_temporal_w, float step_size_temporal
 );
 
 // ── Phase 3: flow splatting ─────────────────────────────────────────────────

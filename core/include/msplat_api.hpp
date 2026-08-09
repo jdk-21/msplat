@@ -42,6 +42,10 @@ struct Config {
     int deformRotNPoly = 0;
     int deformRotNFourier = 0;
     float deformRotLr = 0.0001f;
+    // Temporal envelope (Phase 4): w(tau) = exp(-(tau-m)^2 * softplus(s)) on
+    // opacity, so a gaussian need not explain every frame of the sequence.
+    bool deformTemporal = false;
+    float deformTempLr = 0.01f;
 
     // ── Flow splatting (Phase 3) ────────────────────────────────────────────
     // L = L_color + flowWeight * L_flow + rigidWeight * L_rigid.

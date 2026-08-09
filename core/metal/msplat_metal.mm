@@ -162,6 +162,7 @@ struct MetalContext {
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
     // 4D deformation (Phase 2)
     id<MTLComputePipelineState> deform_forward_kernel_cpso;
+    id<MTLComputePipelineState> temporal_opacity_fixup_kernel_cpso;
     id<MTLComputePipelineState> deform_backward_adam_kernel_cpso;
     // Flow splatting (Phase 3)
     id<MTLComputePipelineState> velocity_field_kernel_cpso;
@@ -277,6 +278,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
     // 4D deformation
     ctx->deform_forward_kernel_cpso               = load(@"deform_forward_kernel");
+    ctx->temporal_opacity_fixup_kernel_cpso       = load(@"temporal_opacity_fixup_kernel");
     ctx->deform_backward_adam_kernel_cpso         = load(@"deform_backward_adam_kernel");
     // Flow splatting
     ctx->velocity_field_kernel_cpso               = load(@"velocity_field_kernel");
@@ -507,6 +509,16 @@ struct FusedTensorCache {
 };
 static FusedTensorCache g_tcache;
 
+// The temporal envelope (Phase 4), published for the two opacity-packing sites.
+//
+// Threading it through msplat_render/msplat_train_step would mean a signature
+// change in all three frontends for a factor that is only ever read one line
+// deep. Instead msplat_deform_forward — the single place the envelope is
+// computed, and a mandatory predecessor of every 4D render — publishes it here.
+// A static run never calls that function, so the pointer stays null and both
+// packing sites take the unmodified path.
+static MTensor *g_temporal_w = nullptr;
+
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
 }
@@ -664,6 +676,12 @@ static void forward_pipeline(
             ENC_BUF(enc, tile_bins, 12);
             ENC_SCALAR(enc, capacity_u32, 13);
             ENC_BUF(enc, g_tcache.overflow_flag, 14);
+            // Phase 4: die zeitliche Huellkurve wird hier in die gepackte
+            // Opazitaet gefaltet, damit die Compositing-Schleifen unveraendert bleiben.
+            int32_t has_temporal_i = (g_temporal_w && g_temporal_w->defined()) ? 1 : 0;
+            MTensor &tw_buf = has_temporal_i ? *g_temporal_w : opacities;
+            ENC_BUF(enc, tw_buf, 15);
+            ENC_SCALAR(enc, has_temporal_i, 16);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -1046,6 +1064,12 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, tile_bins, 12);
             ENC_SCALAR(enc, capacity_u32, 13);
             ENC_BUF(enc, g_tcache.overflow_flag, 14);
+            // Phase 4: die zeitliche Huellkurve wird hier in die gepackte
+            // Opazitaet gefaltet, damit die Compositing-Schleifen unveraendert bleiben.
+            int32_t has_temporal_i = (g_temporal_w && g_temporal_w->defined()) ? 1 : 0;
+            MTensor &tw_buf = has_temporal_i ? *g_temporal_w : opacities;
+            ENC_BUF(enc, tw_buf, 15);
+            ENC_SCALAR(enc, has_temporal_i, 16);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -1515,6 +1539,10 @@ MTensor& msplat_train_v_quat() {
     return g_tcache.v_quat;
 }
 
+MTensor& msplat_train_v_opacity() {
+    return g_tcache.v_opacity;
+}
+
 // Per-gaussian projected radii from the last forward pass; <= 0 marks a gaussian
 // the projection culled, which the flow pass has to skip.
 MTensor& msplat_forward_radii() {
@@ -1528,14 +1556,19 @@ static inline void dispatch_per_point(id<MTLComputeCommandEncoder> enc,
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
+MTensor *msplat_temporal_envelope() { return g_temporal_w; }
+
 void msplat_deform_forward(
     int num_points, MTensor &means, MTensor &quats, MTensor &deform,
-    float tau, DeformOrders ord, MTensor &means_t, MTensor &quats_t
+    float tau, DeformOrders ord, MTensor &means_t, MTensor &quats_t,
+    MTensor &temporal_w
 ) {
     MetalContext* ctx = get_global_context();
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
     assert(command_buffer && "Failed to retrieve command buffer reference");
     std::array<int32_t, 4> orders = {ord.nPoly, ord.nFourier, ord.qPoly, ord.qFourier};
+    int32_t has_temporal = (ord.temporal && temporal_w.defined()) ? 1 : 0;
+    g_temporal_w = has_temporal ? &temporal_w : nullptr;
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
@@ -1551,7 +1584,31 @@ void msplat_deform_forward(
         // still wants something bound; means_t is a valid, correctly sized stand-in.
         MTensor &qt = ord.hasRot() ? quats_t : means_t;
         ENC_BUF(enc, qt, 7);
+        ENC_SCALAR(enc, has_temporal, 8);
+        MTensor &tw = has_temporal ? temporal_w : means_t;
+        ENC_BUF(enc, tw, 9);
         dispatch_per_point(enc, ctx->deform_forward_kernel_cpso, num_points);
+        [enc endEncoding];
+    });
+}
+
+void msplat_temporal_opacity_fixup(
+    int num_points, MTensor &opacities, MTensor &temporal_w,
+    MTensor &v_opacity, MTensor &v_temporal_w
+) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->temporal_opacity_fixup_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, opacities, 1);
+        ENC_BUF(enc, temporal_w, 2);
+        ENC_BUF(enc, v_opacity, 3);
+        ENC_BUF(enc, v_temporal_w, 4);
+        dispatch_per_point(enc, ctx->temporal_opacity_fixup_kernel_cpso, num_points);
         [enc endEncoding];
     });
 }
@@ -1562,7 +1619,8 @@ void msplat_deform_backward_adam(
     float tau, DeformOrders ord,
     float step_size_means, float step_size_rot,
     float beta1, float beta2, float bc2_sqrt, float eps,
-    MTensor &v_mu_extra, MTensor &v_vel
+    MTensor &v_mu_extra, MTensor &v_vel,
+    MTensor &v_temporal_w, float step_size_temporal
 ) {
     MetalContext* ctx = get_global_context();
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
@@ -1571,6 +1629,9 @@ void msplat_deform_backward_adam(
     std::array<float, 4> steps = {step_size_means, step_size_rot, beta1, beta2};
     std::array<float, 2> bc2_eps = {bc2_sqrt, eps};
     std::array<int32_t, 2> has_extra = {v_mu_extra.defined() ? 1 : 0, v_vel.defined() ? 1 : 0};
+    std::array<float, 2> temporal_cfg = {
+        (ord.temporal && v_temporal_w.defined()) ? 1.0f : 0.0f, step_size_temporal};
+    std::array<float, 2> has_temporal = {temporal_cfg[0], 0.0f};
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
@@ -1590,6 +1651,9 @@ void msplat_deform_backward_adam(
         ENC_BUF(enc, mu_x, 10);
         ENC_BUF(enc, vel_x, 11);
         ENC_STDARR(enc, has_extra, 12);
+        MTensor &vtw = has_temporal[0] != 0.0f ? v_temporal_w : v_mean3d;
+        ENC_BUF(enc, vtw, 13);
+        ENC_STDARR(enc, temporal_cfg, 14);
         dispatch_per_point(enc, ctx->deform_backward_adam_kernel_cpso, num_points);
         [enc endEncoding];
     });
