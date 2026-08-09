@@ -119,6 +119,30 @@ public:
         size_t shape[2] = {4, 4};
         return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
     }
+
+    // Per-frame identity of one split: which physical camera shot the frame,
+    // when, and from where. The masked evaluation needs all three — it builds a
+    // background model per camera, which is only meaningful if the frames of
+    // one camera can be told apart from the rest of the rig. cam_id is -1 when
+    // the loader does not know it, and callers then fall back to grouping by
+    // pose, the same rule attachFlowToCameras uses.
+    nb::list camera_meta(bool use_test) {
+        auto &cams = use_test ? test_cams : train_cams;
+        nb::list out;
+        for (auto &cam : cams) {
+            float *buf = new float[16];
+            memcpy(buf, cam.camToWorld, 16 * sizeof(float));
+            nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+            size_t shape[2] = {4, 4};
+
+            nb::dict d;
+            d["cam_id"] = cam.camId;
+            d["time"] = cam.time;
+            d["pose"] = nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
+            out.append(d);
+        }
+        return out;
+    }
 };
 
 // ── GaussianTrainer ─────────────────────────────────────────────────────────
@@ -294,6 +318,36 @@ public:
         // Copy to numpy-owned buffer
         float *buf = new float[h * w * 3];
         memcpy(buf, rgb_cpu.data_ptr(), h * w * 3 * sizeof(float));
+
+        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+        size_t shape[3] = {(size_t)h, (size_t)w, 3};
+        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+    }
+
+    // Ground-truth image of a camera → numpy (H, W, 3) float32.
+    //
+    // Deliberately routed through the same getGPUImage(downscale) call that
+    // evaluate() uses, instead of letting callers re-read the file: the image
+    // the model is scored against is downscaled by the resolution schedule and
+    // composited over the background for RGBA sources. Re-deriving either in
+    // Python would silently disagree with evaluate() the moment a run uses a
+    // non-zero --num-downscales.
+    nb::object gt_image(int cam_idx, bool use_test) {
+        auto &cams = use_test ? dataset_ptr->test_cams : dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size()) {
+            throw std::runtime_error("Camera index out of range");
+        }
+
+        MTensor gt_cpu;
+        @autoreleasepool {
+            Camera &cam = cams[cam_idx];
+            gt_cpu = cam.getGPUImage(model->getDownscaleFactor(current_step)).cpu();
+        }
+
+        int h = gt_cpu.size(0);
+        int w = gt_cpu.size(1);
+        float *buf = new float[h * w * 3];
+        memcpy(buf, gt_cpu.data_ptr(), h * w * 3 * sizeof(float));
 
         nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
         size_t shape[3] = {(size_t)h, (size_t)w, 3};
@@ -560,7 +614,10 @@ NB_MODULE(_core, m) {
         .def_prop_ro("num_train", &Dataset::num_train, "Number of training cameras.")
         .def_prop_ro("num_test", &Dataset::num_test, "Number of test cameras (0 unless eval_mode=True).")
         .def("camera_pose", &Dataset::camera_pose, "index"_a,
-            "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.");
+            "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.")
+        .def("camera_meta", &Dataset::camera_meta, "use_test"_a = false,
+            "Per-frame cam_id, time and pose of one split, as a list of dicts.\n"
+            "cam_id is -1 if the loader does not provide one.");
 
     // GaussianTrainer
     nb::class_<GaussianTrainer>(m, "GaussianTrainer",
@@ -578,6 +635,11 @@ NB_MODULE(_core, m) {
         .def("render", &GaussianTrainer::render,
             "cam_idx"_a, "use_test"_a = false,
             "Render a camera view. Returns a numpy array of shape (H, W, 3), float32, RGB [0,1].")
+        .def("gt_image", &GaussianTrainer::gt_image,
+            "cam_idx"_a, "use_test"_a = false,
+            "The ground-truth image a camera is scored against, at the same resolution\n"
+            "render() produces and composited the same way evaluate() sees it.\n"
+            "Returns numpy (H, W, 3) float32, RGB [0,1].")
         .def("render_from_pose", &GaussianTrainer::render_from_pose,
             "cam_to_world"_a, "ref_cam_idx"_a = 0,
             "Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).\n"

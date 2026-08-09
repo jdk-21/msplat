@@ -89,6 +89,13 @@ class Dataset:
         """Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array."""
         ...
 
+    def camera_meta(self, use_test: bool = False) -> list[dict[str, object]]:
+        """Per-frame cam_id, time and pose of one split, as a list of dicts.
+
+        cam_id is -1 if the loader does not provide one.
+        """
+        ...
+
 class GaussianTrainer:
     """3D Gaussian Splatting trainer. All computation runs on the Metal GPU."""
 
@@ -119,6 +126,18 @@ class GaussianTrainer:
         use_test: bool = False,
     ) -> NDArray[np.float32]:
         """Render a camera view. Returns a numpy array of shape (H, W, 3), float32, RGB [0,1]."""
+        ...
+
+    def gt_image(
+        self,
+        cam_idx: int,
+        use_test: bool = False,
+    ) -> NDArray[np.float32]:
+        """The ground-truth image a camera is scored against.
+
+        Same resolution render() produces and composited the way evaluate() sees
+        it. Returns numpy (H, W, 3) float32, RGB [0,1].
+        """
         ...
 
     def render_from_pose(

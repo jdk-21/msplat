@@ -50,33 +50,57 @@ static int64_t initNumPoints() {
 
 static void loadSplit(const std::string &projectRoot, const std::string &file,
                       bool isTest, bool whiteBackground, InputData &data,
-                      float &initExtent) {
+                      float &initExtent, std::string &pointsFile) {
     auto path = fs::path(projectRoot) / file;
     if (!fs::exists(path)) return;
 
     std::ifstream f(path.string());
     json j = json::parse(f);
 
-    const float angleX = j.value("camera_angle_x", 0.0f);
-    if (angleX <= 0.0f)
-        throw std::runtime_error("D-NeRF: missing or invalid camera_angle_x in " + file);
-
-    // Optional extensions used by our own multi-camera stage generator. D-NeRF
-    // itself ships none of them, so the defaults reproduce it exactly.
+    // Optional extensions used by our own multi-camera stage generator and the
+    // COLMAP rig converter. D-NeRF itself ships none of them, so the defaults
+    // reproduce it exactly.
     const int nomW = j.value("w", DNERF_NOMINAL_RES);
     const int nomH = j.value("h", DNERF_NOMINAL_RES);
     initExtent = j.value("init_extent", initExtent);
+    pointsFile = j.value("points_file", pointsFile);
+
+    // A real rig is built from physically distinct cameras, each with its own
+    // calibration, so intrinsics may be given per frame. camera_angle_x stays
+    // the fallback and is only required when nothing else supplies a focal
+    // length — a synthetic dataset where every camera is the same virtual lens.
+    const float angleX = j.value("camera_angle_x", 0.0f);
+    const bool haveGlobalFocal = angleX > 0.0f;
+    const float globalFocal = haveGlobalFocal
+                                  ? 0.5f * nomW / std::tan(0.5f * angleX)
+                                  : 0.0f;
 
     for (auto &frame : j["frames"]) {
         Camera cam;
-        cam.width = nomW;
-        cam.height = nomH;
+        cam.width = frame.value("w", nomW);
+        cam.height = frame.value("h", nomH);
+
         // Blender's camera_angle_x is the full horizontal FOV; pixels are square,
         // so the vertical focal length is the same number, not one derived from
         // the height.
-        cam.fx = cam.fy = 0.5f * nomW / std::tan(0.5f * angleX);
-        cam.cx = 0.5f * nomW;
-        cam.cy = 0.5f * nomH;
+        const float fx = frame.value("fl_x", globalFocal);
+        if (fx <= 0.0f)
+            throw std::runtime_error(
+                "D-NeRF: " + file + " has neither a valid camera_angle_x nor a "
+                "per-frame fl_x");
+        cam.fx = fx;
+        cam.fy = frame.value("fl_y", fx);
+        cam.cx = frame.value("cx", 0.5f * cam.width);
+        cam.cy = frame.value("cy", 0.5f * cam.height);
+
+        // Brown-Conrady coefficients, applied by Camera::loadImage, which
+        // undistorts and then rewrites the intrinsics to match the crop.
+        cam.k1 = frame.value("k1", 0.0f);
+        cam.k2 = frame.value("k2", 0.0f);
+        cam.k3 = frame.value("k3", 0.0f);
+        cam.p1 = frame.value("p1", 0.0f);
+        cam.p2 = frame.value("p2", 0.0f);
+
         cam.camId = frame.value("cam_id", -1);
 
         // file_path is extension-less ("./train/r_000").
@@ -102,11 +126,35 @@ static void loadSplit(const std::string &projectRoot, const std::string &file,
 InputData loaders::loadDnerf(const std::string &projectRoot, bool whiteBackground) {
     InputData data;
     float initExtent = INIT_CUBE_HALF_EXTENT;
-    loadSplit(projectRoot, "transforms_train.json", false, whiteBackground, data, initExtent);
-    loadSplit(projectRoot, "transforms_test.json", true, whiteBackground, data, initExtent);
+    std::string pointsFile;
+    loadSplit(projectRoot, "transforms_train.json", false, whiteBackground, data,
+              initExtent, pointsFile);
+    loadSplit(projectRoot, "transforms_test.json", true, whiteBackground, data,
+              initExtent, pointsFile);
     if (data.cameras.empty())
         throw std::runtime_error("D-NeRF: no frames found in " + projectRoot);
     data.hasExplicitSplit = true;
+
+    // A real capture has been through SfM already, and its sparse cloud is a far
+    // better start than a random cube: it sits on actual surfaces, carries
+    // measured colour, and — the part that matters on a stage — is shaped like
+    // the room instead of like a box centred on the origin. Optional, because a
+    // synthetic dataset has no SfM step to take it from.
+    if (!pointsFile.empty()) {
+        auto p = fs::path(pointsFile);
+        if (p.is_relative()) p = fs::path(projectRoot) / p;
+        if (!fs::exists(p))
+            throw std::runtime_error("D-NeRF: points_file not found: " + p.string());
+        data.points = (p.extension() == ".bin") ? readColmapPoints(p.string())
+                                                : readPly(p.string());
+        if (data.points.count > 0) {
+            autoScaleAndCenter(data);
+            return data;
+        }
+        // An empty cloud is a broken conversion, not a reason to silently fall
+        // back to noise and let it show up as bad reconstruction much later.
+        throw std::runtime_error("D-NeRF: points_file holds no points: " + p.string());
+    }
 
     // No SfM points — seed a uniform random cloud around the object, the same
     // initialisation the published dynamic-Gaussian baselines use.

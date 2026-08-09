@@ -141,6 +141,18 @@ def main():
         export_frames_full_sh: bool = False
         """4D: keep full SH in the frames (default: DC only, ~4x smaller files)"""
 
+        eval_dynamic: bool = False
+        """Also score only the moving image content (fixed-camera rigs; needs --eval)"""
+
+        eval_dynamic_mode: str = "frame"
+        """'frame' scores what moves around each frame, 'union' every pixel the action ever touches"""
+
+        eval_dynamic_dilate: int = 3
+        """Pixels the dynamic mask grows by, to include soft edges and cast shadow"""
+
+        eval_dynamic_temporal: int = 2
+        """Frames the dynamic mask grows by along time, to catch the ghost trail"""
+
     args = tyro.cli(Args)
 
     from msplat import TrainingConfig, Dataset, GaussianTrainer, sync, cleanup
@@ -259,6 +271,34 @@ def main():
         print(f"  SSIM:  {metrics['ssim']:.4f}")
         print(f"  L1:    {metrics['l1']:.4f}")
         print(f"  Gaussians: {metrics['num_gaussians']:,}")
+
+        if args.eval_dynamic:
+            from msplat.dynamic_eval import evaluate_dynamic
+
+            print("\n=== Evaluation, nur bewegter Bildinhalt ===")
+            dyn = evaluate_dynamic(
+                trainer, dataset,
+                mode=args.eval_dynamic_mode,
+                dilate_radius=args.eval_dynamic_dilate,
+                temporal_radius=args.eval_dynamic_temporal,
+            )
+            cov = dyn["coverage"]
+            print(f"  Maske: {cov * 100:.1f}% der Pixel, {dyn['num_cameras']} Kamera(s), "
+                  f"{dyn['num_frames']} Frames")
+            print(f"  PSNR:  {dyn['psnr_all']:.4f} global  ->  {dyn['psnr_dyn']:.4f} dynamisch")
+            print(f"  SSIM:  {dyn['ssim_all']:.4f} global  ->  {dyn['ssim_dyn']:.4f} dynamisch")
+            if dyn["num_skipped"]:
+                print(f"  {dyn['num_skipped']} Frame(s) übersprungen: deren Kamera hat "
+                      "weniger als 3 Zeitpunkte.")
+            # A mask covering almost nothing or almost everything makes the
+            # number meaningless in opposite ways, and both happen for real
+            # reasons — a subject too small to threshold, or a camera that moved.
+            if cov < 0.005:
+                print("  WARNUNG: fast keine Pixel als bewegt erkannt — Motiv zu klein "
+                      "oder Schwelle zu hoch.")
+            elif cov > 0.6:
+                print("  WARNUNG: Maske deckt fast das ganze Bild ab — steht die Kamera "
+                      "wirklich still?")
 
     cleanup()
 
