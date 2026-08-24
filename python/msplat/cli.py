@@ -1,5 +1,7 @@
 """msplat-train CLI entry point."""
 
+import json
+import os.path
 import sys
 
 
@@ -69,6 +71,9 @@ def main():
 
         save_every: int = -1
         """Save every N steps (-1 to disable)"""
+
+        checkpoint: str = ""
+        """Optional post-training .msplat checkpoint path with reproducibility sidecar JSON"""
 
         eval: bool = False
         """Evaluate on held-out test views"""
@@ -240,9 +245,61 @@ def main():
     trainer.export_ply(args.output)
     print(f"Saved {args.output}")
 
-    if args.export_frames > 0:
-        import os.path
+    if args.checkpoint:
+        trainer.save_checkpoint(args.checkpoint)
+        checkpoint_metadata_path = f"{args.checkpoint}.json"
+        checkpoint_metadata = {
+            "schema_version": 1,
+            "checkpoint": os.path.abspath(args.checkpoint),
+            "input": os.path.abspath(args.input),
+            "dataset": {
+                "downscale_factor": args.downscale_factor,
+                "eval_mode": args.eval,
+                "test_every": args.test_every,
+                "white_background": args.white_background,
+            },
+            "training_config": {
+                "iterations": config.iterations,
+                "sh_degree": config.sh_degree,
+                "sh_degree_interval": config.sh_degree_interval,
+                "ssim_weight": config.ssim_weight,
+                "num_downscales": config.num_downscales,
+                "resolution_schedule": config.resolution_schedule,
+                "refine_every": config.refine_every,
+                "warmup_length": config.warmup_length,
+                "reset_alpha_every": config.reset_alpha_every,
+                "densify_grad_thresh": config.densify_grad_thresh,
+                "densify_size_thresh": config.densify_size_thresh,
+                "stop_screen_size_at": config.stop_screen_size_at,
+                "split_screen_size": config.split_screen_size,
+                "keep_crs": config.keep_crs,
+                "downscale_factor": config.downscale_factor,
+                "output": config.output,
+                "save_every": config.save_every,
+                "bg_color": config.bg_color,
+                "deform_n_poly": config.deform_n_poly,
+                "deform_n_fourier": config.deform_n_fourier,
+                "deform_lr": config.deform_lr,
+                "deform_rot_n_poly": config.deform_rot_n_poly,
+                "deform_rot_n_fourier": config.deform_rot_n_fourier,
+                "deform_rot_lr": config.deform_rot_lr,
+                "flow": config.flow,
+                "flow_weight": config.flow_weight,
+                "flow_min_coverage": config.flow_min_coverage,
+                "rigid": config.rigid,
+                "rigid_weight": config.rigid_weight,
+                "rigid_beta": config.rigid_beta,
+                "rigid_k": config.rigid_k,
+                "deform_temporal": config.deform_temporal,
+                "deform_temp_lr": config.deform_temp_lr,
+            },
+        }
+        with open(checkpoint_metadata_path, "w", encoding="utf-8") as metadata_file:
+            json.dump(checkpoint_metadata, metadata_file, indent=2, sort_keys=True)
+            metadata_file.write("\n")
+        print(f"Saved checkpoint provenance {checkpoint_metadata_path}")
 
+    if args.export_frames > 0:
         if args.deform_n_poly == 0 and args.deform_n_fourier == 0:
             print(
                 "Warning: --export-frames on a static model — all frames identical.",

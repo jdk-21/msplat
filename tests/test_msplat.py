@@ -4,6 +4,9 @@ import pytest
 import numpy as np
 import tempfile
 import os
+import json
+import sys
+import types
 
 GARDEN = os.path.join(os.path.dirname(__file__), "..", "datasets", "mipnerf360", "garden")
 HAS_GARDEN = os.path.isdir(GARDEN)
@@ -46,6 +49,100 @@ def test_training_config_mutable():
     cfg = TrainingConfig()
     cfg.iterations = 500
     assert cfg.iterations == 500
+
+
+def test_cli_checkpoint_writes_provenance_sidecar_without_export_frames(tmp_path, monkeypatch):
+    """The post-training checkpoint branch writes its sidecar before the optional frame export path."""
+    from msplat import cli
+
+    args = types.SimpleNamespace(
+        input=str(tmp_path / "dataset"),
+        output=str(tmp_path / "scene.ply"),
+        checkpoint=str(tmp_path / "scene.msplat"),
+        num_iters=1,
+        downscale_factor=1.0,
+        num_downscales=0,
+        resolution_schedule=3000,
+        sh_degree=0,
+        sh_degree_interval=1000,
+        ssim_weight=0.2,
+        refine_every=100,
+        warmup_length=500,
+        reset_alpha_every=30,
+        densify_grad_thresh=0.0002,
+        densify_size_thresh=0.01,
+        stop_screen_size_at=4000,
+        split_screen_size=0.05,
+        keep_crs=False,
+        save_every=-1,
+        eval=False,
+        test_every=8,
+        deform_n_poly=0,
+        deform_n_fourier=0,
+        deform_lr=0.001,
+        deform_rot_n_poly=0,
+        deform_rot_n_fourier=0,
+        deform_rot_lr=0.0001,
+        deform_temporal=False,
+        deform_temp_lr=0.01,
+        flow=False,
+        flow_weight=0.03,
+        flow_min_coverage=0.1,
+        rigid=False,
+        rigid_weight=0.5,
+        rigid_beta=100.0,
+        rigid_k=20,
+        white_background=False,
+        export_frames=0,
+        export_frames_dir="",
+        export_frames_t0=0.0,
+        export_frames_t1=1.0,
+        export_frames_full_sh=False,
+    )
+
+    class FakeTrainingConfig:
+        def __init__(self, **kwargs):
+            for name, value in kwargs.items():
+                setattr(self, name, value)
+            self.bg_color = [0.6130, 0.0101, 0.3984]
+
+    class FakeDataset:
+        num_train = 1
+        num_test = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeTrainer:
+        def __init__(self, *args):
+            pass
+
+        def train(self, *args, **kwargs):
+            pass
+
+        def export_ply(self, path):
+            pass
+
+        def save_checkpoint(self, path):
+            with open(path, "wb") as checkpoint:
+                checkpoint.write(b"checkpoint")
+
+    fake_tyro = types.ModuleType("tyro")
+    fake_tyro.cli = lambda _: args
+    fake_msplat = types.ModuleType("msplat")
+    fake_msplat.TrainingConfig = FakeTrainingConfig
+    fake_msplat.Dataset = FakeDataset
+    fake_msplat.GaussianTrainer = FakeTrainer
+    fake_msplat.sync = lambda: None
+    fake_msplat.cleanup = lambda: None
+    monkeypatch.setitem(sys.modules, "tyro", fake_tyro)
+    monkeypatch.setitem(sys.modules, "msplat", fake_msplat)
+
+    cli.main()
+
+    sidecar = tmp_path / "scene.msplat.json"
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text())["checkpoint"] == os.path.abspath(args.checkpoint)
 
 
 # ── Dataset tests ────────────────────────────────────────────────────────────
