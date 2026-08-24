@@ -24,6 +24,30 @@ class TrainingConfig:
     bg_color: list[float]
     """Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398]."""
 
+    # 4D trajectories (Phase 2) — both orders 0 means static 3DGS.
+    deform_n_poly: int
+    deform_n_fourier: int
+    deform_lr: float
+    deform_rot_n_poly: int
+    deform_rot_n_fourier: int
+    deform_rot_lr: float
+    deform_temporal: bool
+    deform_temp_lr: float
+    # Flow splatting (Phase 3) — needs <input>/flow/<stem>.flo.
+    flow: bool
+    flow_weight: float
+    flow_min_coverage: float
+    rigid: bool
+    rigid_weight: float
+    rigid_beta: float
+    rigid_k: int
+    # Depth supervision + opacity entropy (Phase 4) — depth needs
+    # <input>/depth/<stem>.dpt.
+    depth: bool
+    depth_weight: float
+    depth_min_coverage: float
+    opacity_entropy_weight: float
+
     def __init__(
         self,
         iterations: int = 30000,
@@ -44,6 +68,25 @@ class TrainingConfig:
         output: str = "splat.ply",
         save_every: int = -1,
         bg_color: list[float] = ...,
+        deform_n_poly: int = 0,
+        deform_n_fourier: int = 0,
+        deform_lr: float = 0.001,
+        deform_rot_n_poly: int = 0,
+        deform_rot_n_fourier: int = 0,
+        deform_rot_lr: float = 0.0001,
+        flow: bool = False,
+        flow_weight: float = 0.03,
+        flow_min_coverage: float = 0.1,
+        rigid: bool = False,
+        rigid_weight: float = 0.5,
+        rigid_beta: float = 100.0,
+        rigid_k: int = 20,
+        deform_temporal: bool = False,
+        deform_temp_lr: float = 0.01,
+        depth: bool = False,
+        depth_weight: float = 0.5,
+        depth_min_coverage: float = 0.5,
+        opacity_entropy_weight: float = 0.0,
     ) -> None: ...
 
 class TrainingStats:
@@ -62,6 +105,38 @@ class TrainingStats:
     @property
     def ms_per_step(self) -> float:
         """Wall-clock time for this step in milliseconds."""
+        ...
+
+    @property
+    def flow_loss(self) -> float:
+        """Mean L1 optical-flow error in pixels (0 unless flow=True)."""
+        ...
+
+    @property
+    def rigid_loss(self) -> float:
+        """Weighted L_rigid (0 unless rigid=True)."""
+        ...
+
+    @property
+    def temporal_mean(self) -> float:
+        """Mean temporal envelope weight at the last timestamp (1 unless deform_temporal=True)."""
+        ...
+
+    @property
+    def temporal_off_frac(self) -> float:
+        """Share of gaussians the envelope switched off (w < 0.01) at the last timestamp."""
+        ...
+
+    @property
+    def depth_loss(self) -> float:
+        """Mean L1 depth error over the supervised pixels, in scaled world units
+        (0 unless depth=True)."""
+        ...
+
+    @property
+    def opacity_entropy(self) -> float:
+        """Mean binary entropy of the opacities in nats. ln(2)=0.69 is a model that has
+        committed to nothing; near 0 means every gaussian is solid or gone."""
         ...
 
 class Dataset:

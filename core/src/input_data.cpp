@@ -129,6 +129,87 @@ MTensor* Camera::getGPUFlow() {
     return &gpuFlow;
 }
 
+// ── Ground-truth depth (Phase 4) ────────────────────────────────────────────
+//
+// .dpt is the .flo layout with one channel instead of two: float magic
+// 202021.50, int32 width, int32 height, then width*height float32 depths along
+// the view axis, with 0 meaning "no ground truth here". Deliberately not .npy:
+// the reader for a 12-byte header already exists two functions up, and parsing
+// numpy's ASCII dict header in C++ would be work with nothing to show for it.
+
+MTensor* Camera::getGPUDepth() {
+    if (gpuDepth.defined()) return &gpuDepth;
+    if (depthPath.empty()) return nullptr;
+
+    std::ifstream f(depthPath, std::ios::binary);
+    if (!f.is_open()) {
+        fprintf(stderr, "Depth: cannot open %s\n", depthPath.c_str());
+        depthPath.clear();
+        return nullptr;
+    }
+    float magic = 0; int32_t w = 0, h = 0;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    f.read(reinterpret_cast<char*>(&w), sizeof(w));
+    f.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!f || magic != 202021.50f || w <= 0 || h <= 0) {
+        fprintf(stderr, "Depth: %s is not a .dpt depth file\n", depthPath.c_str());
+        depthPath.clear();
+        return nullptr;
+    }
+    if (w != width || h != height) {
+        fprintf(stderr, "Depth: %s is %dx%d but the image is %dx%d — ignoring\n",
+                depthPath.c_str(), w, h, width, height);
+        depthPath.clear();
+        return nullptr;
+    }
+
+    std::vector<float> src((size_t)w * h);
+    f.read(reinterpret_cast<char*>(src.data()), (std::streamsize)(src.size() * sizeof(float)));
+    if (!f) {
+        fprintf(stderr, "Depth: %s is truncated\n", depthPath.c_str());
+        depthPath.clear();
+        return nullptr;
+    }
+
+    gpuDepth = gpu_empty({h, w}, DType::Float32);
+    float *dst = gpuDepth.data<float>();
+    for (size_t i = 0; i < src.size(); i++) {
+        float d = src[i];
+        // Non-positive and non-finite both mean "no ground truth", and the loss
+        // kernel tests exactly d > 0 — so they have to collapse to the same 0.
+        dst[i] = (std::isfinite(d) && d > 0.0f) ? d * depthScale : 0.0f;
+    }
+    return &gpuDepth;
+}
+
+static fs::path findDepthFile(const fs::path &depthDir, const std::string &imagePath) {
+    fs::path img(imagePath);
+    std::string stem = img.stem().string();
+    if (img.has_parent_path()) {
+        fs::path nested = depthDir / img.parent_path().filename() / (stem + ".dpt");
+        if (fs::exists(nested)) return nested;
+    }
+    fs::path flat = depthDir / (stem + ".dpt");
+    if (fs::exists(flat)) return flat;
+    return {};
+}
+
+int attachDepthToCameras(std::vector<Camera> &cams, const std::string &datasetPath,
+                         float sceneScale) {
+    fs::path depthDir = fs::path(datasetPath) / "depth";
+    if (!fs::is_directory(depthDir)) return 0;
+
+    int linked = 0;
+    for (auto &cam : cams) {
+        fs::path p = findDepthFile(depthDir, cam.filePath);
+        if (p.empty()) continue;
+        cam.depthPath = p.string();
+        cam.depthScale = sceneScale;
+        linked++;
+    }
+    return linked;
+}
+
 // Identifies the physical camera a frame came from. Loaders that know it (a
 // multi-camera rig labels its frames) set Camera::camId; otherwise we fall back
 // to the extrinsics, because a camera bolted to a stage repeats bit-identical

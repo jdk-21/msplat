@@ -100,6 +100,10 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     dc.rigidWeight = config.rigidWeight;
     dc.rigidBeta = config.rigidBeta;
     dc.rigidK = config.rigidK;
+    dc.depth = config.depth;
+    dc.depthWeight = config.depthWeight;
+    dc.depthMinCoverage = config.depthMinCoverage;
+    dc.opacityEntropyWeight = config.opacityEntropyWeight;
     if (dc.flow) {
         int n = attachFlowToCameras(impl->ds->trainCams, impl->ds->path);
         fprintf(stderr, "Flow: %d of %zu train frames have ground-truth flow\n",
@@ -108,6 +112,21 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
             fprintf(stderr, "Flow: nothing found under %s/flow — L_flow disabled\n",
                     impl->ds->path.c_str());
             dc.flow = false;
+        }
+    }
+    if (dc.depth) {
+        // Only the train cameras: depth on a test frame would leak the held-out
+        // view straight into the geometry. The test .dpt files stay on disk for
+        // evaluation, which reads them outside the trainer.
+        int n = attachDepthToCameras(impl->ds->trainCams, impl->ds->path,
+                                     impl->ds->data.scale);
+        fprintf(stderr, "Depth: %d of %zu train frames have ground-truth depth "
+                "(scene scale %.4f)\n", n, impl->ds->trainCams.size(),
+                impl->ds->data.scale);
+        if (n == 0) {
+            fprintf(stderr, "Depth: nothing found under %s/depth — L_depth disabled\n",
+                    impl->ds->path.c_str());
+            dc.depth = false;
         }
     }
 

@@ -57,6 +57,19 @@ struct Config {
     float rigidWeight = 0.5f;        // gamma3
     float rigidBeta = 100.0f;        // w_ij = exp(-beta * ||mu_i - mu_j||)
     int rigidK = 20;                 // neighbours per gaussian
+    // ── Depth supervision + opacity entropy (Phase 4) ───────────────────────
+    // With few cameras the photometric loss does not pin down geometry: a
+    // translucent cloud can fit every training view and still render a held-out
+    // view as fog. These two terms add the missing constraint — depth moves
+    // gaussians onto the surface, entropy makes them commit to being solid or
+    // gone. Both are off by default and change nothing when off.
+    //
+    // depth needs ground-truth depth in <dataset>/depth/<stem>.dpt.
+    bool depth = false;
+    float depthWeight = 0.5f;
+    float depthMinCoverage = 0.5f;   // a near-empty pixel carries no depth
+    float opacityEntropyWeight = 0.0f;
+
     // Composite transparent source images over white instead of black. The
     // published D-NeRF protocol uses white; must match bgColor to evaluate fairly.
     bool whiteBackground = false;

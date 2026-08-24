@@ -128,6 +128,23 @@ def main():
         rigid_k: int = 20
         """Phase 3: neighbours per Gaussian for L_rigid"""
 
+        depth: bool = False
+        """Phase 4: supervise the rendered depth against ground truth.
+        Needs <input>/depth/<image stem>.dpt (see tools/make_stage_benchmark.py --depth-only).
+        With few cameras the photometric loss alone does not pin down geometry — a
+        translucent cloud fits every training view and renders novel views as fog."""
+
+        depth_weight: float = 0.5
+        """Phase 4: weight of the L1 depth term"""
+
+        depth_min_coverage: float = 0.5
+        """Phase 4: ignore depth pixels where the model accumulates less alpha than this"""
+
+        opacity_entropy_weight: float = 0.0
+        """Phase 4: push every opacity towards 0 or 1 (0 = off). Complements --depth:
+        depth moves Gaussians onto the surface, this makes them commit to being
+        solid or gone. Try 0.01-0.1."""
+
         white_background: bool = False
         """Composite transparent source images over white (D-NeRF protocol)"""
 
@@ -195,6 +212,10 @@ def main():
         rigid_k=args.rigid_k,
         deform_temporal=args.deform_temporal,
         deform_temp_lr=args.deform_temp_lr,
+        depth=args.depth,
+        depth_weight=args.depth_weight,
+        depth_min_coverage=args.depth_min_coverage,
+        opacity_entropy_weight=args.opacity_entropy_weight,
     )
 
     if (args.flow or args.rigid) and args.deform_n_poly == 0 and args.deform_n_fourier == 0:
@@ -238,6 +259,10 @@ def main():
         if args.deform_temporal:
             line += (f"  env={stats.temporal_mean:.3f}"
                      f"  aus={stats.temporal_off_frac * 100:.1f}%")
+        if args.depth:
+            line += f"  depth_l1={stats.depth_loss:.4f}"
+        if args.opacity_entropy_weight > 0:
+            line += f"  H={stats.opacity_entropy:.3f}"
         print(line)
 
     trainer.train(on_step, callback_every=100)
@@ -290,6 +315,10 @@ def main():
                 "rigid_weight": config.rigid_weight,
                 "rigid_beta": config.rigid_beta,
                 "rigid_k": config.rigid_k,
+                "depth": config.depth,
+                "depth_weight": config.depth_weight,
+                "depth_min_coverage": config.depth_min_coverage,
+                "opacity_entropy_weight": config.opacity_entropy_weight,
                 "deform_temporal": config.deform_temporal,
                 "deform_temp_lr": config.deform_temp_lr,
             },

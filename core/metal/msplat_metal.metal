@@ -2342,6 +2342,305 @@ kernel void rigid_loss_kernel(
         atomic_fetch_add_explicit(loss_sum, local_loss, memory_order_relaxed);
 }
 
+// ===== Depth supervision + opacity entropy (Phase 4) =====
+//
+// Why this exists. On a 4-camera stage the photometric loss alone is not enough
+// to pin down geometry: a translucent cloud spread through the volume explains
+// every training view essentially perfectly (measured: 33-39 dB on the training
+// cameras) while the held-out view renders as fog (21 dB). The colour loss has
+// no term that prefers a surface over a cloud, so nothing pushes it there.
+//
+// Two terms are added against that, and they are deliberately complementary:
+//
+//   L_depth   moves gaussians ALONG the ray to where the surface is.
+//   L_entropy pushes each opacity towards 0 or 1, so the cloud has to decide
+//             between being solid or disappearing.
+//
+// Depth alone leaves a translucent shell at the right distance; entropy alone
+// makes the fog opaque without moving it. The pair is what collapses fog into
+// a surface.
+//
+// The depth pass rides on the colour forward exactly the way the flow pass
+// does: same tile_bins, same packed buffers, same final_Ts, and therefore the
+// same alpha/T sequence. It must run after the colour rasterizer for the same
+// camera and before project_and_sh_backward_kernel, which is what turns
+// v_depth into a gradient on the means.
+
+// Scatter per-gaussian view-space depth into the sorted/packed order.
+// depths[] is the very same buffer the tile sort used as its key, so no new
+// per-gaussian quantity has to be computed for this. Range check as in
+// pack_flow_kernel: the dispatch covers the whole packed capacity, but the sort
+// only initialised the slots the tiles actually used.
+kernel void pack_depth_kernel(
+    constant uint& count            [[buffer(0)]],
+    constant int32_t* gaussian_ids  [[buffer(1)]],
+    constant float* depths          [[buffer(2)]],
+    device float* packed_depth      [[buffer(3)]],
+    constant int& num_points        [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+    int g = gaussian_ids[idx];
+    packed_depth[idx] = (g >= 0 && g < num_points) ? depths[g] : 0.0f;
+}
+
+// Alpha-composite per-gaussian depth. Mirrors nd_rasterize_forward_kernel's
+// traversal and early-outs so the alpha/T sequence matches the colour pass.
+//
+// Writes the UNNORMALISED sum(d_i * alpha_i * T_i). The normaliser is
+// sum(alpha_i * T_i), which is exactly 1 - final_Ts from the colour pass, so
+// there is no reason to accumulate and store it a second time — the loss
+// kernel divides by it.
+kernel void depth_rasterize_forward_kernel(
+    constant uint3& tile_bounds     [[buffer(0)]],
+    constant uint3& img_size        [[buffer(1)]],
+    constant int* tile_bins         [[buffer(2)]],
+    constant float* packed_xy_opac  [[buffer(3)]],
+    constant float* packed_conic    [[buffer(4)]],
+    constant float* packed_depth    [[buffer(5)]],
+    device float* out_depth         [[buffer(6)]],
+    constant uint2& blockDim        [[buffer(7)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    float px = (float)j, py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float depth_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float pix_out = 0.f;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            depth_batch[tr] = packed_depth[idx];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (done || !inside) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) { done = true; break; }
+            pix_out = fma(depth_batch[t], alpha * T, pix_out);
+            T = next_T;
+        }
+    }
+
+    if (inside) out_depth[pix_id] = pix_out;
+}
+
+// L1 depth loss on the EXPECTED depth, forward and backward in one pass.
+//
+//   D = sum(d_i w_i) / sum(w_i),   w_i = alpha_i T_i,   sum(w_i) = 1 - T_final
+//
+// Normalising matters here. The raw sum sum(d_i w_i) is small wherever the
+// model is transparent, so an unnormalised loss would be minimised by making
+// things MORE transparent in front of a far surface — the exact failure this
+// term is supposed to cure. Dividing by the coverage decouples the depth value
+// from the opacity, and the min_coverage guard keeps the division away from
+// zero (a pixel that is nearly empty carries no depth information anyway).
+//
+// gt_depth is (H,W): metric depth along the view axis in the SCALED world of
+// the trained scene, 0 meaning "no ground truth here" (the raycaster's misses).
+kernel void depth_loss_kernel(
+    constant uint2& img_size        [[buffer(0)]],
+    constant float* out_depth       [[buffer(1)]],
+    constant float* gt_depth        [[buffer(2)]],   // (H,W), 0 = no ground truth
+    constant float* final_Ts        [[buffer(3)]],
+    constant float& inv_n           [[buffer(4)]],
+    constant float& grad_scale      [[buffer(5)]],   // weight * inv_n
+    constant float& min_coverage    [[buffer(6)]],
+    device float* v_depth_img       [[buffer(7)]],
+    device atomic_float* loss_sum   [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    // No early return before the simd reduction — simd_sum needs every lane.
+    float contrib = 0.f;
+    if (gid.x < img_size.x && gid.y < img_size.y) {
+        uint pix = gid.y * img_size.x + gid.x;
+        float gt = gt_depth[pix];
+        float coverage = 1.0f - final_Ts[pix];
+        bool use = (gt > 0.f) && (coverage >= min_coverage);
+        float inv_cov = 1.0f / max(coverage, 1e-6f);
+        float d = out_depth[pix] * inv_cov - gt;
+        // Stores dL/dD itself, not dL/dD_raw. The backward needs the gradient
+        // with respect to the NORMALISED depth, because it also differentiates
+        // the normaliser — see depth_rasterize_backward_kernel.
+        v_depth_img[pix] = use ? sign(d) * grad_scale : 0.f;
+        if (use) contrib = abs(d) * inv_n;
+    }
+    contrib = simd_sum(contrib);
+    if (simd_is_first() && contrib != 0.f)
+        atomic_fetch_add_explicit(loss_sum, contrib, memory_order_relaxed);
+}
+
+// Backward of the depth compositing, through BOTH levers the rendered depth
+// has: where a gaussian sits along the ray, and how opaque it is.
+//
+// The opacity path is the one that matters, and leaving it out is why an
+// earlier version of this kernel did not work. Measured on rig4: the
+// per-gaussian depths were already right (mean 1.44 against a ground-truth mean
+// of 1.61) while the COMPOSITED depth came out at 0.21 — a translucent layer
+// sitting right in front of the camera. A gradient that may only slide gaussian
+// centres along the ray cannot fix that: push the front layer back and the next
+// layer of the cloud becomes the front one. The loss fell 30% and stalled, and
+// the held-out view was still fog. Fog is dissolved by making it transparent,
+// so the loss has to be able to reach alpha.
+//
+// With D = D_raw/C, D_raw = sum_i d_i w_i, C = sum_i w_i = 1 - T_final,
+// w_i = alpha_i T_i, and e_i = d_i - D:
+//
+//   dL/dd_i     = (g/C) * w_i
+//   dL/dalpha_i = (g/C) * [ T_i * e_i - S_e(i) / (1 - alpha_i) ],
+//                 S_e(i) = sum_{j>i} e_j w_j
+//
+// which is the colour backward's recursion with the colour channel replaced by
+// the depth residual e_i. Differentiating the normaliser is what produces e_i:
+// a gaussian is pushed transparent exactly when it sits on the wrong side of
+// the depth the pixel currently renders, and pushed opaque when it agrees.
+// There is no background term — normalising by C already excludes the
+// uncovered part of the pixel.
+//
+// Walking backward needs the last contributor per pixel, and final_index from
+// the colour pass is exactly that: this traversal mirrors the colour forward's.
+//
+// v_depth needs no chain kernel of its own — project_and_sh_backward_kernel
+// already reads it and turns it into v_mean3d += viewmat_row2 * v_depth. That
+// buffer was allocated, zeroed per iteration and wired into that backward from
+// the start; until this pass, nothing ever wrote to it.
+kernel void depth_rasterize_backward_kernel(
+    constant uint3& tile_bounds     [[buffer(0)]],
+    constant uint3& img_size        [[buffer(1)]],
+    constant int* tile_bins         [[buffer(2)]],
+    constant int32_t* gaussian_ids  [[buffer(3)]],
+    constant float* packed_xy_opac  [[buffer(4)]],
+    constant float* packed_conic    [[buffer(5)]],
+    constant float* packed_depth    [[buffer(6)]],
+    constant float* v_depth_img     [[buffer(7)]],
+    constant float* out_depth       [[buffer(8)]],
+    constant float* final_Ts        [[buffer(9)]],
+    constant int* final_index       [[buffer(10)]],
+    device atomic_float* v_depth    [[buffer(11)]],
+    device atomic_float* v_opacity  [[buffer(12)]],
+    constant uint2& blockDim        [[buffer(13)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int)img_size.y || j >= (int)img_size.x) return;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    int32_t pix_id = i * (int)img_size.x + j;
+
+    const float g_out = v_depth_img[pix_id];
+    if (g_out == 0.f) return;   // masked pixel
+
+    const float T_final = final_Ts[pix_id];
+    const float C = 1.0f - T_final;
+    if (C <= 1e-6f) return;
+    const float D = out_depth[pix_id] / C;
+    const float gC = g_out / C;
+
+    float px = (float)j, py = (float)i;
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    int bin_final = final_index[pix_id];
+
+    float T = T_final;      // rebuilt backwards via T *= 1/(1-alpha)
+    float S_e = 0.f;        // sum over gaussians BEHIND the current one
+
+    for (int idx = bin_final - 1; idx >= range.x; --idx) {
+        const float3 xy_opac = read_packed_float3(packed_xy_opac, idx);
+        const float3 conic_local = read_packed_float3(packed_conic, idx);
+        const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+        const float sigma = fma(0.5f,
+            fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+            conic_local.y * delta.x * delta.y);
+        if (sigma < 0.f || sigma >= 5.55f) continue;
+        const float ev = exp(-sigma);
+        const float alpha = min(0.999f, xy_opac.z * ev);
+        if (alpha < 1.f / 255.f) continue;
+
+        const float ra = 1.f / (1.f - alpha);
+        T *= ra;                        // now the T the forward saw here
+        const float w = alpha * T;
+        const float e = packed_depth[idx] - D;
+
+        const int gid = gaussian_ids[idx];
+        atomic_fetch_add_explicit(v_depth + gid, gC * w, memory_order_relaxed);
+        const float v_alpha = gC * fma(T, e, -S_e * ra);
+        // d alpha / d opacity = exp(-sigma), matching the colour backward's
+        // convention exactly (it stores the gradient of the sigmoid'd opacity
+        // and leaves the sigmoid derivative to Adam's normalisation).
+        atomic_fetch_add_explicit(v_opacity + gid, ev * v_alpha, memory_order_relaxed);
+
+        S_e = fma(e, w, S_e);
+    }
+}
+
+// Binary-entropy regulariser on the opacity, added straight into v_opacity.
+//
+//   s = sigmoid(logit),  H(s) = -[s log s + (1-s) log(1-s)]
+//   dH/ds = log((1-s)/s),  ds/dlogit = s(1-s)
+//   => d(weight * mean H)/d logit = weight/N * log((1-s)/s) * s(1-s)
+//
+// Minimising H drives every gaussian towards fully solid or fully invisible and
+// empties the middle, which is where a fog model lives (measured on the rig4
+// checkpoint: mean opacity 0.30 across the whole volume, no concentration on
+// any surface). The gradient vanishes at both ends — s log(1/s) -> 0 — so this
+// is a gentle push out of the middle, not a hard constraint, and it cannot
+// drive an opacity to a value it could not otherwise reach.
+//
+// Runs after the rasterizer backward and before the fused Adam on opacity,
+// i.e. it is folded into the same single Adam step and does not perturb the
+// moment estimates.
+kernel void opacity_entropy_kernel(
+    constant int& num_points        [[buffer(0)]],
+    constant float* opacities       [[buffer(1)]],   // raw logits
+    device float* v_opacity         [[buffer(2)]],
+    constant float& grad_scale      [[buffer(3)]],   // weight / num_points
+    device atomic_float* loss_sum   [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    float contrib = 0.f;
+    if (idx < (uint)num_points) {
+        float s = 1.0f / (1.0f + exp(-opacities[idx]));
+        // Clamp only inside the logs. s itself stays exact, so the s(1-s)
+        // factor still takes the gradient to zero at the ends.
+        float sc = clamp(s, 1e-6f, 1.0f - 1e-6f);
+        v_opacity[idx] += grad_scale * log((1.0f - sc) / sc) * s * (1.0f - s);
+        contrib = -(sc * log(sc) + (1.0f - sc) * log(1.0f - sc));
+    }
+    contrib = simd_sum(contrib);
+    if (simd_is_first() && contrib != 0.f)
+        atomic_fetch_add_explicit(loss_sum, contrib, memory_order_relaxed);
+}
+
 // ===== Fused Projection + SH Kernels =====
 // Combines project_gaussians_forward_kernel + compute_sh_forward_kernel into one dispatch.
 // Saves 1 kernel dispatch + 1 read of means3d per direction. Skips SH for culled gaussians.

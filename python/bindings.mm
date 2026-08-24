@@ -61,6 +61,11 @@ struct TrainingConfig {
     float rigid_weight = 0.5f;
     float rigid_beta = 100.0f;
     int rigid_k = 20;
+    // Depth supervision + opacity entropy (Phase 4)
+    bool depth = false;
+    float depth_weight = 0.5f;
+    float depth_min_coverage = 0.5f;
+    float opacity_entropy_weight = 0.0f;
 };
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
@@ -74,6 +79,9 @@ struct TrainingStats {
     float rigid_loss = 0.0f;
     float temporal_mean = 1.0f;
     float temporal_off_frac = 0.0f;
+    // Phase 4 — 0.0 unless depth / opacity entropy are enabled.
+    float depth_loss = 0.0f;
+    float opacity_entropy = 0.0f;
 };
 
 // ── Dataset ─────────────────────────────────────────────────────────────────
@@ -176,6 +184,10 @@ public:
         dc.rigidWeight = cfg.rigid_weight;
         dc.rigidBeta = cfg.rigid_beta;
         dc.rigidK = cfg.rigid_k;
+        dc.depth = cfg.depth;
+        dc.depthWeight = cfg.depth_weight;
+        dc.depthMinCoverage = cfg.depth_min_coverage;
+        dc.opacityEntropyWeight = cfg.opacity_entropy_weight;
         if (dc.flow) {
             int n = attachFlowToCameras(dataset.train_cams, dataset.path);
             fprintf(stderr, "Flow: %d of %zu train frames have ground-truth flow\n",
@@ -184,6 +196,20 @@ public:
                 fprintf(stderr, "Flow: nothing found under %s/flow — L_flow disabled\n",
                         dataset.path.c_str());
                 dc.flow = false;
+            }
+        }
+        if (dc.depth) {
+            // Train cameras only — supervising a test frame's depth would leak
+            // the held-out view into the geometry.
+            int n = attachDepthToCameras(dataset.train_cams, dataset.path,
+                                         dataset.data.scale);
+            fprintf(stderr, "Depth: %d of %zu train frames have ground-truth depth "
+                    "(scene scale %.4f)\n", n, dataset.train_cams.size(),
+                    dataset.data.scale);
+            if (n == 0) {
+                fprintf(stderr, "Depth: nothing found under %s/depth — L_depth disabled\n",
+                        dataset.path.c_str());
+                dc.depth = false;
             }
         }
 
@@ -251,6 +277,8 @@ public:
             stats.rigid_loss = model->lastRigidLoss;
             stats.temporal_mean = model->lastTemporalMean;
             stats.temporal_off_frac = model->lastTemporalOffFrac;
+            stats.depth_loss = model->lastDepthLoss;
+            stats.opacity_entropy = model->lastOpacityEntropy;
             return stats;
         }
     }
@@ -479,7 +507,9 @@ NB_MODULE(_core, m) {
                 int deform_rot_n_poly, int deform_rot_n_fourier, float deform_rot_lr,
                 bool flow, float flow_weight, float flow_min_coverage,
                 bool rigid, float rigid_weight, float rigid_beta, int rigid_k,
-                bool deform_temporal, float deform_temp_lr) {
+                bool deform_temporal, float deform_temp_lr,
+                bool depth, float depth_weight, float depth_min_coverage,
+                float opacity_entropy_weight) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -516,6 +546,10 @@ NB_MODULE(_core, m) {
             cfg->rigid_k = rigid_k;
             cfg->deform_temporal = deform_temporal;
             cfg->deform_temp_lr = deform_temp_lr;
+            cfg->depth = depth;
+            cfg->depth_weight = depth_weight;
+            cfg->depth_min_coverage = depth_min_coverage;
+            cfg->opacity_entropy_weight = opacity_entropy_weight;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -549,7 +583,11 @@ NB_MODULE(_core, m) {
             "rigid_beta"_a = 100.0f,
             "rigid_k"_a = 20,
             "deform_temporal"_a = false,
-            "deform_temp_lr"_a = 0.01f)
+            "deform_temp_lr"_a = 0.01f,
+            "depth"_a = false,
+            "depth_weight"_a = 0.5f,
+            "depth_min_coverage"_a = 0.5f,
+            "opacity_entropy_weight"_a = 0.0f)
         .def_rw("deform_n_poly", &TrainingConfig::deform_n_poly)
         .def_rw("deform_n_fourier", &TrainingConfig::deform_n_fourier)
         .def_rw("deform_lr", &TrainingConfig::deform_lr)
@@ -563,6 +601,10 @@ NB_MODULE(_core, m) {
         .def_rw("flow_min_coverage", &TrainingConfig::flow_min_coverage)
         .def_rw("rigid", &TrainingConfig::rigid)
         .def_rw("rigid_weight", &TrainingConfig::rigid_weight)
+        .def_rw("depth", &TrainingConfig::depth)
+        .def_rw("depth_weight", &TrainingConfig::depth_weight)
+        .def_rw("depth_min_coverage", &TrainingConfig::depth_min_coverage)
+        .def_rw("opacity_entropy_weight", &TrainingConfig::opacity_entropy_weight)
         .def_rw("rigid_beta", &TrainingConfig::rigid_beta)
         .def_rw("rigid_k", &TrainingConfig::rigid_k)
         .def_rw("iterations", &TrainingConfig::iterations)
@@ -597,6 +639,12 @@ NB_MODULE(_core, m) {
                 "Mean temporal envelope weight at the last timestamp (1 unless deform_temporal=True).")
         .def_ro("temporal_off_frac", &TrainingStats::temporal_off_frac,
                 "Share of gaussians the envelope switched off (w < 0.01) at the last timestamp.")
+        .def_ro("depth_loss", &TrainingStats::depth_loss,
+                "Mean L1 depth error over the supervised pixels, in scaled world units "
+                "(0 unless depth=True).")
+        .def_ro("opacity_entropy", &TrainingStats::opacity_entropy,
+                "Mean binary entropy of the opacities in nats. ln(2)=0.69 is a model that "
+                "has committed to nothing; near 0 means every gaussian is solid or gone.")
         .def("__repr__", [](const TrainingStats &s) {
             return "TrainingStats(iteration=" + std::to_string(s.iteration) +
                    ", splats=" + std::to_string(s.splat_count) +

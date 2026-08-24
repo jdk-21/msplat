@@ -173,6 +173,12 @@ struct MetalContext {
     id<MTLComputePipelineState> flow_rasterize_backward_kernel_cpso;
     id<MTLComputePipelineState> flow_project_backward_kernel_cpso;
     id<MTLComputePipelineState> rigid_loss_kernel_cpso;
+    // Depth supervision + opacity entropy (Phase 4)
+    id<MTLComputePipelineState> pack_depth_kernel_cpso;
+    id<MTLComputePipelineState> depth_rasterize_forward_kernel_cpso;
+    id<MTLComputePipelineState> depth_loss_kernel_cpso;
+    id<MTLComputePipelineState> depth_rasterize_backward_kernel_cpso;
+    id<MTLComputePipelineState> opacity_entropy_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -289,6 +295,12 @@ MetalContext* init_msplat_metal_context() {
     ctx->flow_rasterize_backward_kernel_cpso      = load(@"flow_rasterize_backward_kernel");
     ctx->flow_project_backward_kernel_cpso        = load(@"flow_project_backward_kernel");
     ctx->rigid_loss_kernel_cpso                   = load(@"rigid_loss_kernel");
+    // Depth supervision + opacity entropy
+    ctx->pack_depth_kernel_cpso                   = load(@"pack_depth_kernel");
+    ctx->depth_rasterize_forward_kernel_cpso      = load(@"depth_rasterize_forward_kernel");
+    ctx->depth_loss_kernel_cpso                   = load(@"depth_loss_kernel");
+    ctx->depth_rasterize_backward_kernel_cpso     = load(@"depth_rasterize_backward_kernel");
+    ctx->opacity_entropy_kernel_cpso              = load(@"opacity_entropy_kernel");
 
     [metal_library release];
 
@@ -490,6 +502,37 @@ struct FusedTensorCache {
         ensure_loss_sums(dev);
     }
 
+    // Depth supervision buffers (Phase 4). Same lifetime rule as the flow ones:
+    // nothing is allocated unless a depth pass actually runs. depth_loss_sum is
+    // its own single-slot buffer rather than a third slot in flow_loss_sum,
+    // because depth runs inside msplat_train_step while flow/rigid run after it
+    // — sharing a buffer would mean sharing a zeroing point across two encoders.
+    int depth_capacity = 0, depth_img_h = 0, depth_img_w = 0;
+    MTensor packed_depth, out_depth, v_depth_img, depth_loss_sum;
+    // Which half of depth_loss_sum this step writes; the other half holds the
+    // previous step's finished values. See the comment on g_last_depth_losses.
+    int depth_slot = 0;
+
+    void ensure_depth(int64_t cap, int ih, int iw, id<MTLDevice> dev) {
+        if (cap != depth_capacity) {
+            depth_capacity = (int)cap;
+            packed_depth = mtensor_empty(dev, {cap}, DType::Float32);
+        }
+        if (ih != depth_img_h || iw != depth_img_w) {
+            depth_img_h = ih; depth_img_w = iw;
+            out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            v_depth_img = mtensor_empty(dev, {ih, iw}, DType::Float32);
+        }
+        // Two pairs of [depth loss, opacity entropy], alternating per step.
+        // Zeroed once here, on the CPU: no GPU work can be referencing a buffer
+        // that did not exist a moment ago, and the very first step reads the
+        // pair no step has written yet.
+        if (!depth_loss_sum.defined()) {
+            depth_loss_sum = mtensor_empty(dev, {4}, DType::Float32);
+            memset(depth_loss_sum.data_ptr(), 0, depth_loss_sum.nbytes());
+        }
+    }
+
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
             bwd_num_points = np;
@@ -519,8 +562,70 @@ static FusedTensorCache g_tcache;
 // packing sites take the unmodified path.
 static MTensor *g_temporal_w = nullptr;
 
+// The depth target for the NEXT msplat_train_step, published the same way and
+// for the same reason as g_temporal_w above.
+//
+// Depth cannot follow the flow pattern of a separate post-step entry point.
+// Its gradient has to land in v_depth before project_and_sh_backward_kernel
+// converts it into a gradient on the means, and that kernel runs inside the
+// fused train step. A post-hoc pass could only reach v_mu_extra, which feeds
+// the 4D coefficients and not the base means — the opposite of what depth
+// supervision is for.
+//
+// The caller sets this before every msplat_train_step (to a tensor or to
+// nullptr) and never leaves it standing: a stale target would silently
+// supervise one camera with another camera's depth.
+struct DepthTarget {
+    MTensor *gt = nullptr;       // (H, W) float32, 0 = no ground truth
+    float weight = 0.0f;
+    float min_coverage = 0.5f;
+};
+static DepthTarget g_depth_target;
+
+// Opacity entropy weight for the next train step, 0 = off. Set the same way.
+static float g_opacity_entropy_weight = 0.0f;
+
+void msplat_set_depth_target(MTensor *gt_depth, float weight, float min_coverage) {
+    g_depth_target.gt = (gt_depth && weight > 0.0f) ? gt_depth : nullptr;
+    g_depth_target.weight = weight;
+    g_depth_target.min_coverage = min_coverage;
+}
+
+void msplat_set_opacity_entropy(float weight) {
+    g_opacity_entropy_weight = weight;
+}
+
+// Last completed step's [depth loss, mean opacity entropy].
+//
+// Filled from a command-buffer completion handler, not by reading the
+// accumulator on the CPU after the step. The obvious version does not work, and
+// it fails silently: msplat_train_step only ENCODES its work, so a read right
+// after it races the GPU and lands either before the kernels have accumulated
+// or after the next step's blit has cleared them. That reported a steady,
+// entirely believable 0.0000 for both terms while the kernels were in fact
+// running correctly — the sort of bug that gets mistaken for a dead feature.
+//
+// Two things make the handler read safe. The accumulator is double-buffered, so
+// a step clears and accumulates into only its own half while the other half
+// holds the previous step's finished values; and the handler for step N runs
+// when step N's command buffer completes, which on one queue is necessarily
+// before step N+2 — the next step to touch that half — begins.
+//
+// The handler runs on an arbitrary thread, so these are written without a lock.
+// They are reporting numbers printed every hundred steps; a torn float would
+// cost nothing and cannot occur for aligned 4-byte stores anyway.
+static float g_last_depth_losses[2] = {0.0f, 0.0f};
+
+void msplat_last_depth_losses(float *depth_loss, float *entropy) {
+    if (depth_loss) *depth_loss = g_last_depth_losses[0];
+    if (entropy) *entropy = g_last_depth_losses[1];
+}
+
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
+    g_depth_target = DepthTarget{};
+    g_opacity_entropy_weight = 0.0f;
+    g_last_depth_losses[0] = g_last_depth_losses[1] = 0.0f;
 }
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
@@ -912,6 +1017,28 @@ std::tuple<MTensor, float> msplat_train_step(
     g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
     g_tcache.ensure_backward(num_points, features_rest_bases, ctx->device);
 
+    // Depth supervision / opacity entropy for this step. Resolved once here so
+    // the encode lambdas and the blit-zero agree on whether they run at all.
+    const bool run_depth = g_depth_target.gt != nullptr
+                        && g_depth_target.gt->defined()
+                        && g_depth_target.gt->numel() == (int64_t)img_height * img_width;
+    const bool run_entropy = g_opacity_entropy_weight > 0.0f;
+    if (run_depth || run_entropy) {
+        g_tcache.ensure_depth(capacity, img_height, img_width, ctx->device);
+        g_tcache.depth_slot ^= 1;
+    }
+    const size_t depth_slot_off = (size_t)(2 * g_tcache.depth_slot) * sizeof(float);
+    if (g_depth_target.gt != nullptr && !run_depth) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "msplat: depth target is %lld values but the image is "
+                    "%ux%u — depth supervision is off for this step\n",
+                    (long long)(g_depth_target.gt->defined() ? g_depth_target.gt->numel() : 0),
+                    img_width, img_height);
+            warned = true;
+        }
+    }
+
     if (std::getenv("MSPLAT_DEBUG_NAN")) {
         msplat_gpu_sync();
         const float *sc = scales.data<float>();
@@ -1194,6 +1321,115 @@ std::tuple<MTensor, float> msplat_train_step(
         }
     };
 
+    // Depth supervision: pack -> composite -> loss -> backward into v_depth.
+    // Sits between the colour rasterizer backward and the projection backward,
+    // because the latter is what turns v_depth into a gradient on the means.
+    auto encode_depth = [&](id<MTLComputeCommandEncoder> enc) {
+        MTensor &packed_depth = g_tcache.packed_depth;
+        MTensor &out_depth = g_tcache.out_depth;
+        MTensor &v_depth_img = g_tcache.v_depth_img;
+
+        // 1. Scatter per-gaussian view-space depth into packed order.
+        {
+            NSUInteger tpg = MIN(ctx->pack_depth_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                                 (NSUInteger)capacity_u32);
+            [enc setComputePipelineState:ctx->pack_depth_kernel_cpso];
+            ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, gaussian_ids, 1);
+            ENC_BUF(enc, depths, 2); ENC_BUF(enc, packed_depth, 3);
+            ENC_SCALAR(enc, num_points, 4);
+            [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 2. Composite it, mirroring the colour forward's 8x8 threadgroups.
+        {
+            [enc setComputePipelineState:ctx->depth_rasterize_forward_kernel_cpso];
+            [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
+            [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+            ENC_BUF(enc, tile_bins, 2); ENC_BUF(enc, packed_xy_opac, 3);
+            ENC_BUF(enc, packed_conic, 4); ENC_BUF(enc, packed_depth, 5);
+            ENC_BUF(enc, out_depth, 6);
+            [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X,
+                                                  (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1)
+                   threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 3. L1 on the expected depth; writes v_depth_img and the loss slot.
+        {
+            float inv_n = 1.0f / (float)(img_height * img_width);
+            float grad_scale = g_depth_target.weight * inv_n;
+            [enc setComputePipelineState:ctx->depth_loss_kernel_cpso];
+            [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:0];
+            ENC_BUF(enc, out_depth, 1);
+            [enc setBuffer:g_depth_target.gt->buffer() offset:0 atIndex:2];
+            ENC_BUF(enc, final_Ts, 3);
+            ENC_SCALAR(enc, inv_n, 4); ENC_SCALAR(enc, grad_scale, 5);
+            ENC_SCALAR(enc, g_depth_target.min_coverage, 6);
+            ENC_BUF(enc, v_depth_img, 7);
+            [enc setBuffer:g_tcache.depth_loss_sum.buffer() offset:depth_slot_off atIndex:8];
+            [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1)
+                   threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 4. Accumulate into v_depth (position along the ray) and v_opacity
+        //    (how solid the gaussian is). 16x16 here, matching the flow
+        //    backward's choice — this walk is per-pixel and unbatched, so the
+        //    threadgroup shape is free and the larger group amortises the
+        //    launch better.
+        {
+            [enc setComputePipelineState:ctx->depth_rasterize_backward_kernel_cpso];
+            [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
+            [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+            ENC_BUF(enc, tile_bins, 2); ENC_BUF(enc, gaussian_ids, 3);
+            ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5);
+            ENC_BUF(enc, packed_depth, 6); ENC_BUF(enc, v_depth_img, 7);
+            ENC_BUF(enc, out_depth, 8); ENC_BUF(enc, final_Ts, 9);
+            ENC_BUF(enc, final_idx, 10);
+            ENC_BUF(enc, v_depth, 11); ENC_BUF(enc, v_opacity, 12);
+            auto blk = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{16, 16});
+            [enc setBytes:blk->data() length:sizeof(*blk) atIndex:13];
+            [enc dispatchThreadgroups:MTLSizeMake((img_width + 15u) / 16u,
+                                                  (img_height + 15u) / 16u, 1)
+                   threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        }
+    };
+
+    // Opacity entropy: adds into v_opacity, so it has to land after the
+    // rasterizer backward that fills v_opacity and before the fused Adam that
+    // consumes it. Folding it into the same Adam step is the point — a second
+    // Adam step on the same tensor would corrupt the moment estimates.
+    auto encode_entropy = [&](id<MTLComputeCommandEncoder> enc) {
+        float grad_scale = g_opacity_entropy_weight / (float)num_points;
+        NSUInteger tpg = MIN(ctx->opacity_entropy_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                             (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->opacity_entropy_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, opacities, 1);
+        ENC_BUF(enc, v_opacity, 2); ENC_SCALAR(enc, grad_scale, 3);
+        [enc setBuffer:g_tcache.depth_loss_sum.buffer()
+                offset:depth_slot_off + sizeof(float) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    // Publishes this step's depth/entropy sums once the GPU has actually
+    // produced them. See the comment on g_last_depth_losses for why this cannot
+    // be a plain read after encoding.
+    auto add_depth_readback = [&](id<MTLCommandBuffer> cb) {
+        if (!run_depth && !run_entropy) return;
+        float *pair = g_tcache.depth_loss_sum.data<float>() + 2 * g_tcache.depth_slot;
+        float inv_np = (num_points > 0) ? 1.0f / (float)num_points : 0.0f;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+            // The depth kernel already folded in its 1/(W*H); the entropy
+            // kernel accumulates a raw sum, so its mean is formed here.
+            g_last_depth_losses[0] = pair[0];
+            g_last_depth_losses[1] = pair[1] * inv_np;
+        }];
+    };
+
     // Packed SH Adam hyperparameters (must match SHAdamParams in .metal)
     struct SHAdamParams {
         float dc_step_size, dc_bc2_sqrt;
@@ -1290,6 +1526,18 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
         // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
+        if (run_depth || run_entropy) {
+            // GPU-side, like the flow pass: a CPU memset would race the encoder.
+            // Only this step's half — the other one is being read on the CPU.
+            [blit fillBuffer:g_tcache.depth_loss_sum.buffer()
+                       range:NSMakeRange(depth_slot_off, 2 * sizeof(float)) value:0];
+        }
+        if (run_depth) {
+            [blit fillBuffer:g_tcache.out_depth.buffer()
+                       range:NSMakeRange(0, g_tcache.out_depth.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.v_depth_img.buffer()
+                       range:NSMakeRange(0, g_tcache.v_depth_img.nbytes()) value:0];
+        }
         [blit endEncoding];
     };
 
@@ -1363,6 +1611,19 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_rast_bwd(enc);
             [enc endEncoding];
 
+            // Depth and entropy share the rast_bwd encoder slot rather than
+            // claiming counter indices of their own: N_TRAIN_STAGES and the
+            // stage-name table are fixed, and both terms are off by default.
+            if (run_depth || run_entropy) {
+                enc = [command_buffer computeCommandEncoder];
+                if (run_depth) {
+                    encode_depth(enc);
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+                if (run_entropy) encode_entropy(enc);
+                [enc endEncoding];
+            }
+
             // Stage 6: proj_sh_bwd + Adam
             enc = make_profiled_encoder(5);
             encode_proj_sh_bwd_adam(enc);
@@ -1372,6 +1633,7 @@ std::tuple<MTensor, float> msplat_train_step(
             enc = make_profiled_encoder(6);
             encode_grad_stats(enc);
             [enc endEncoding];
+            add_depth_readback(command_buffer);
         });
 
         // Add completion handler to read timestamps after GPU finishes
@@ -1435,6 +1697,17 @@ std::tuple<MTensor, float> msplat_train_step(
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_rast_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // Depth writes v_depth, entropy adds into v_opacity — both must be
+            // complete before the projection backward reads the one and the
+            // fused Adam consumes the other.
+            if (run_depth) {
+                encode_depth(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            if (run_entropy) {
+                encode_entropy(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
             encode_proj_sh_bwd_adam(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -1442,6 +1715,7 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_grad_stats(enc);
 
             [enc endEncoding];
+            add_depth_readback(command_buffer);
         });
     }
 

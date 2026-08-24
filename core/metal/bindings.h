@@ -205,4 +205,25 @@ MTensor& msplat_flow_render(
     float dt, MTensor &flow2d
 );
 
+// ── Phase 4: depth supervision + opacity entropy ────────────────────────────
+//
+// Both terms run INSIDE the next msplat_train_step rather than after it, so
+// they are published here instead of being passed as arguments — the same
+// device the temporal envelope uses, and for a stronger reason: the depth
+// gradient has to reach v_depth before project_and_sh_backward_kernel turns it
+// into a gradient on the means, and that kernel is inside the fused step.
+//
+// gt_depth is (H, W) float32, metric depth along the view axis in the scaled
+// world of the trained scene, 0 meaning "no ground truth for this pixel".
+// Pass nullptr (or weight 0) to switch depth supervision off.
+//
+// Both must be set before EVERY train step, because they persist: a target left
+// standing would supervise the next camera with this camera's depth.
+void msplat_set_depth_target(MTensor *gt_depth, float weight, float min_coverage);
+void msplat_set_opacity_entropy(float weight);
+
+// Last step's depth loss (mean L1 over the supervised pixels, unweighted) and
+// mean opacity entropy in nats. Either pointer may be null.
+void msplat_last_depth_losses(float *depth_loss, float *entropy);
+
 #endif

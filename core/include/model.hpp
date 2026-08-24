@@ -31,6 +31,15 @@ struct DeformConfig {
   // tempLr is its own Adam step size, because centre and width live on a very
   // different scale from the trajectory coefficients.
   float tempLr = 0.0f;
+
+  // Depth supervision and opacity entropy. Independent of the 4D machinery —
+  // both work on a purely static model too, which is the point: they constrain
+  // geometry, and a sparse rig gets that wrong whether or not it is moving.
+  bool depth = false;
+  float depthWeight = 0.5f;
+  float depthMinCoverage = 0.5f;
+  float opacityEntropyWeight = 0.0f;
+
   bool any4D() const { return ord.any(); }
   bool anyPhase3() const { return flow || rigid; }
   bool temporal() const { return ord.temporal; }
@@ -127,6 +136,14 @@ struct Model{
   // Steps that actually ran a flow pass, and steps that had to skip it because
   // the progressive downscale did not match the ground-truth flow resolution.
   long flowSteps = 0, flowSkippedSteps = 0;
+  // Mean L1 depth error over the supervised pixels (in the scaled world, so
+  // comparable across scenes only after undoing InputData::scale) and the mean
+  // binary entropy of the opacities in nats. The entropy is the number to watch
+  // for fog: ln(2) = 0.69 is a model that has committed to nothing.
+  float lastDepthLoss = 0.0f, lastOpacityEntropy = 0.0f;
+  // Steps that ran a depth pass, and steps that had ground truth but could not
+  // use it — progressive downscaling, or a missing/mismatched .dpt file.
+  long depthSteps = 0, depthSkippedSteps = 0;
 
   static constexpr int N_ADAM_GROUPS = 7;  // 6 static + 1 combined 4D group
   MTensor adam_exp_avg[N_ADAM_GROUPS];

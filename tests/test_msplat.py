@@ -34,6 +34,31 @@ def test_training_config_defaults():
     assert cfg.warmup_length == 500
 
 
+def test_training_config_depth_supervision_defaults_to_off():
+    """Depth and opacity entropy must change nothing unless asked for.
+
+    Both terms alter the geometry, so a run that does not name them has to be
+    bit-for-bit the old behaviour — every earlier benchmark number in the README
+    was measured without them.
+    """
+    from msplat import TrainingConfig
+
+    cfg = TrainingConfig()
+    assert cfg.depth is False
+    assert cfg.opacity_entropy_weight == pytest.approx(0.0)
+
+
+def test_training_config_depth_supervision_round_trips():
+    from msplat import TrainingConfig
+
+    cfg = TrainingConfig(depth=True, depth_weight=2.0, depth_min_coverage=0.25,
+                         opacity_entropy_weight=0.01)
+    assert cfg.depth is True
+    assert cfg.depth_weight == pytest.approx(2.0)
+    assert cfg.depth_min_coverage == pytest.approx(0.25)
+    assert cfg.opacity_entropy_weight == pytest.approx(0.01)
+
+
 def test_training_config_custom():
     from msplat import TrainingConfig
 
@@ -92,6 +117,10 @@ def test_cli_checkpoint_writes_provenance_sidecar_without_export_frames(tmp_path
         rigid_weight=0.5,
         rigid_beta=100.0,
         rigid_k=20,
+        depth=False,
+        depth_weight=0.5,
+        depth_min_coverage=0.5,
+        opacity_entropy_weight=0.0,
         white_background=False,
         export_frames=0,
         export_frames_dir="",

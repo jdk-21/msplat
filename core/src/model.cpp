@@ -786,6 +786,25 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
     // makes the gradient the fused step computes correct for both.
     MTensor &m = deformedMeans(cam.time);
 
+    // Depth supervision and opacity entropy run inside the fused step (the
+    // depth gradient has to reach v_depth before the projection backward turns
+    // it into a gradient on the means), so they are published rather than
+    // passed. Both are set on EVERY iteration, including to "off" — a target
+    // left standing would supervise the next camera with this camera's depth.
+    //
+    // The width guard is the same one the flow pass uses: ground-truth depth is
+    // on the full-resolution pixel grid, and while progressive downscaling is
+    // active there is nothing to compare against.
+    MTensor *gtDepth = nullptr;
+    if (dcfg.depth && s.width == cam.width && s.height == cam.height) {
+        gtDepth = cam.getGPUDepth();
+        if (gtDepth) depthSteps++; else depthSkippedSteps++;
+    } else if (dcfg.depth) {
+        depthSkippedSteps++;
+    }
+    msplat_set_depth_target(gtDepth, dcfg.depthWeight, dcfg.depthMinCoverage);
+    msplat_set_opacity_entropy(dcfg.opacityEntropyWeight);
+
     auto [r, loss] = msplat_train_step(
         numPoints, m, scales, 1.0f,
         deformedQuats(), cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
@@ -798,6 +817,9 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
         visCounts, xysGradNorm, max2DSize, invMaxDim);
+
+    if (gtDepth || dcfg.opacityEntropyWeight > 0.0f)
+        msplat_last_depth_losses(&lastDepthLoss, &lastOpacityEntropy);
 
     if (is4D()) {
         // ── Phase 3 ──────────────────────────────────────────────────────────

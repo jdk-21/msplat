@@ -54,6 +54,18 @@ struct Camera {
     // resolution does not match the (full-resolution) image.
     MTensor* getGPUFlow();
 
+    // ── Depth supervision (Phase 4) ─────────────────────────────────────────
+    // Ground-truth depth for THIS frame, in the dataset's own world units.
+    // depthScale converts them to the scaled world the model is trained in —
+    // autoScaleAndCenter divides every camera position by max|coordinate|, and
+    // a depth that missed that factor would pull the geometry to the wrong
+    // distance while looking perfectly well-formed.
+    std::string depthPath;
+    float depthScale = 1.0f;
+    MTensor gpuDepth;  // (H, W): metric depth, 0 = no ground truth
+    bool hasDepth() const { return !depthPath.empty(); }
+    MTensor* getGPUDepth();
+
     Image image;
     std::unordered_map<int, Image> imagePyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
@@ -95,5 +107,18 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
 // the split — flowNextIdx indexes exactly that vector. Returns the number of
 // linked frames.
 int attachFlowToCameras(std::vector<Camera> &cams, const std::string &datasetPath);
+
+// Phase 4: point every camera at its ground-truth depth file under
+// <datasetPath>/depth/<image stem>.dpt, mirroring the image tree the same way
+// the flow lookup does. sceneScale is InputData::scale, the factor
+// autoScaleAndCenter applied to the camera positions; it is stored per camera
+// and applied when the file is read. Returns the number of linked frames.
+//
+// Unlike flow this needs no pairing and no next frame, so it is safe to call on
+// the test list too — useful for measuring geometry error on a held-out view,
+// which is the one number that says whether the reconstruction is a surface or
+// a cloud. Training only ever reads it from the train list.
+int attachDepthToCameras(std::vector<Camera> &cams, const std::string &datasetPath,
+                         float sceneScale);
 
 #endif
