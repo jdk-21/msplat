@@ -892,7 +892,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight,
             adam_beta1, adam_beta2, std::sqrt(bc2), adam_eps,
             ranPhase3 ? v_mu_extra : noTensor,
             ranPhase3 ? v_vel : noTensor,
-            dcfg.temporal() ? v_temporal_w : noTensor, dcfg.tempLr / bc1);
+            dcfg.temporal() ? v_temporal_w : noTensor, dcfg.tempLr / bc1,
+            dcfg.l1);
     }
 
     radii = r;

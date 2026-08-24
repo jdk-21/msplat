@@ -53,6 +53,7 @@ struct TrainingConfig {
     // Temporal envelope (Phase 4)
     bool deform_temporal = false;
     float deform_temp_lr = 0.01f;
+    float deform_l1 = 0.0f;
     // Flow splatting (Phase 3)
     bool flow = false;
     float flow_weight = 0.03f;
@@ -177,6 +178,7 @@ public:
         dc.lr = cfg.deform_lr;
         dc.rotLr = cfg.deform_rot_lr;
         dc.tempLr = cfg.deform_temp_lr;
+        dc.l1 = cfg.deform_l1;
         dc.flow = cfg.flow;
         dc.flowWeight = cfg.flow_weight;
         dc.flowMinCoverage = cfg.flow_min_coverage;
@@ -507,7 +509,7 @@ NB_MODULE(_core, m) {
                 int deform_rot_n_poly, int deform_rot_n_fourier, float deform_rot_lr,
                 bool flow, float flow_weight, float flow_min_coverage,
                 bool rigid, float rigid_weight, float rigid_beta, int rigid_k,
-                bool deform_temporal, float deform_temp_lr,
+                bool deform_temporal, float deform_temp_lr, float deform_l1,
                 bool depth, float depth_weight, float depth_min_coverage,
                 float opacity_entropy_weight) {
             new (cfg) TrainingConfig();
@@ -546,6 +548,7 @@ NB_MODULE(_core, m) {
             cfg->rigid_k = rigid_k;
             cfg->deform_temporal = deform_temporal;
             cfg->deform_temp_lr = deform_temp_lr;
+            cfg->deform_l1 = deform_l1;
             cfg->depth = depth;
             cfg->depth_weight = depth_weight;
             cfg->depth_min_coverage = depth_min_coverage;
@@ -584,6 +587,7 @@ NB_MODULE(_core, m) {
             "rigid_k"_a = 20,
             "deform_temporal"_a = false,
             "deform_temp_lr"_a = 0.01f,
+            "deform_l1"_a = 0.0f,
             "depth"_a = false,
             "depth_weight"_a = 0.5f,
             "depth_min_coverage"_a = 0.5f,
@@ -596,6 +600,7 @@ NB_MODULE(_core, m) {
         .def_rw("deform_rot_lr", &TrainingConfig::deform_rot_lr)
         .def_rw("deform_temporal", &TrainingConfig::deform_temporal)
         .def_rw("deform_temp_lr", &TrainingConfig::deform_temp_lr)
+        .def_rw("deform_l1", &TrainingConfig::deform_l1)
         .def_rw("flow", &TrainingConfig::flow)
         .def_rw("flow_weight", &TrainingConfig::flow_weight)
         .def_rw("flow_min_coverage", &TrainingConfig::flow_min_coverage)

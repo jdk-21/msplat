@@ -93,6 +93,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     dc.lr = config.deformLr;
     dc.rotLr = config.deformRotLr;
     dc.tempLr = config.deformTempLr;
+    dc.l1 = config.deformL1;
     dc.flow = config.flow;
     dc.flowWeight = config.flowWeight;
     dc.flowMinCoverage = config.flowMinCoverage;

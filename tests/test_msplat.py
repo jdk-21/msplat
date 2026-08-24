@@ -59,6 +59,14 @@ def test_training_config_depth_supervision_round_trips():
     assert cfg.opacity_entropy_weight == pytest.approx(0.01)
 
 
+def test_training_config_deform_l1_round_trips():
+    from msplat import TrainingConfig
+
+    cfg = TrainingConfig(deform_l1=2.5)
+    assert cfg.deform_l1 == pytest.approx(2.5)
+    assert TrainingConfig().deform_l1 == pytest.approx(0.0)
+
+
 def test_training_config_custom():
     from msplat import TrainingConfig
 
@@ -110,6 +118,7 @@ def test_cli_checkpoint_writes_provenance_sidecar_without_export_frames(tmp_path
         deform_rot_lr=0.0001,
         deform_temporal=False,
         deform_temp_lr=0.01,
+        deform_l1=0.0,
         flow=False,
         flow_weight=0.03,
         flow_min_coverage=0.1,

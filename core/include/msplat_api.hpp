@@ -46,6 +46,10 @@ struct Config {
     // opacity, so a gaussian need not explain every frame of the sequence.
     bool deformTemporal = false;
     float deformTempLr = 0.01f;
+    // L1 shrinkage on the trajectory coefficients (0 = off). Makes a gaussian
+    // that the data do not require to move exactly static, instead of merely
+    // almost static — the room of a stage is the majority of the scene.
+    float deformL1 = 0.0f;
 
     // ── Flow splatting (Phase 3) ────────────────────────────────────────────
     // L = L_color + flowWeight * L_flow + rigidWeight * L_rigid.

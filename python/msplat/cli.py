@@ -106,6 +106,13 @@ def main():
         deform_temp_lr: float = 0.01
         """Phase 4: Adam learning rate for the envelope's centre and width"""
 
+        deform_l1: float = 0.0
+        """Phase 4: L1 shrinkage on the trajectory coefficients (0 = off).
+        Every coefficient is pure motion, so an exact zero means the Gaussian stands still.
+        On a fixed rig most of the scene is static and, unregularized, its Gaussians fit
+        per-frame noise — the static image content then jitters far more than the truth.
+        Try 0.5-5."""
+
         flow: bool = False
         """Phase 3: render optical flow from the velocity field and apply L_flow.
         Needs ground-truth flow in <input>/flow/<image stem>.flo (see tools/precompute_flow.py)."""
@@ -212,6 +219,7 @@ def main():
         rigid_k=args.rigid_k,
         deform_temporal=args.deform_temporal,
         deform_temp_lr=args.deform_temp_lr,
+        deform_l1=args.deform_l1,
         depth=args.depth,
         depth_weight=args.depth_weight,
         depth_min_coverage=args.depth_min_coverage,
@@ -321,6 +329,7 @@ def main():
                 "opacity_entropy_weight": config.opacity_entropy_weight,
                 "deform_temporal": config.deform_temporal,
                 "deform_temp_lr": config.deform_temp_lr,
+                "deform_l1": config.deform_l1,
             },
         }
         with open(checkpoint_metadata_path, "w", encoding="utf-8") as metadata_file:

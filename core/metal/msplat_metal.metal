@@ -1776,6 +1776,30 @@ inline int eval_deform_dbasis(float tau, int n_poly, int n_fourier,
 // mu(t) and q(t) for every gaussian, written to scratch buffers that are then
 // fed to the projection pass in place of the canonical means/quats.
 // quats_t stays unnormalised — quat_to_rotmat normalises internally.
+// Proximaler Schritt der L1-Schrumpfung: soft thresholding.
+//
+// Warum L1 und nicht Weight Decay: die Basis beginnt bei tau^1, es gibt also
+// keinen Konstantterm — jeder Koeffizient ist reine Bewegung, und "Koeffizient
+// exakt 0" heisst "dieser Gaussian steht still". L2 macht Koeffizienten nur
+// klein, L1 macht sie null, und nur echte Nullen nehmen dem statischen Teil der
+// Szene das Zittern vollstaendig. Auf einer Buehne ist das der Normalfall: der
+// Raum steht, ein kleiner Teil bewegt sich.
+//
+// Die Schwelle ist absolut, nicht nach Basisfunktion skaliert. Das ist Absicht:
+// tau liegt in [-0.5, 0.5], also ist tau^6 <= 0.016, und ein hoher Polynomterm
+// braucht einen grossen Koeffizienten, um ueberhaupt etwas zu bewirken. Eine
+// einheitliche Schwelle bestraft damit hochfrequentes Zappeln staerker als
+// glatte Bewegung — genau die gewuenschte Reihenfolge.
+//
+// Gemessen tut der Term genau das (das Zittern des statischen Bildteils faellt
+// von 22x auf 13,5x der Wahrheit) und verbessert das Bild trotzdem nicht, weil
+// er echte Bewegung im selben Zug mitdaempft. Eine ungerichtete Schrumpfung
+// kann beides nicht unterscheiden; L_rigid kann es, weil es die Nachbarschaft
+// kennt. Details im README.
+inline float soft_threshold(float x, float t) {
+    return copysign(max(abs(x) - t, 0.0f), x);
+}
+
 // The temporal envelope and its two derivatives. Kept in one place so forward
 // and backward cannot drift apart.
 //   k = softplus(s) >= 0      w = exp(-(tau - m)^2 * k)
@@ -1906,6 +1930,7 @@ kernel void deform_backward_adam_kernel(
     constant int2& has_extra        [[buffer(12)]], // has_mu_extra, has_vel
     constant float* v_temporal_w    [[buffer(13)]],
     constant float2& temporal_cfg   [[buffer(14)]], // has_temporal, step_t
+    constant float2& l1_thresh      [[buffer(15)]], // L1-Schwelle: Means, Rotation
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points) return;
@@ -1956,6 +1981,15 @@ kernel void deform_backward_adam_kernel(
                             g.y, steps.x, beta1, beta2, bc2_sqrt, eps);
         adam_update_element(deform[o + 2], exp_avg[o + 2], exp_avg_sq[o + 2],
                             g.z, steps.x, beta1, beta2, bc2_sqrt, eps);
+        // Proximaler L1-Schritt NACH dem Adam-Schritt. Der Gradient der
+        // L1-Strafe darf nicht durch Adams zweites Moment laufen: er ist
+        // konstant +-lambda, was den Moment-Schaetzer sofort dominiert und die
+        // Schrumpfung fuer jeden Koeffizienten gleich stark macht, egal wie
+        // wichtig er ist. Als proximaler Schritt bleibt sie exakt lambda*lr
+        // gross und erzeugt echte Nullen.
+        if (l1_thresh.x > 0.0f)
+            for (int c = 0; c < 3; c++)
+                deform[o + c] = soft_threshold(deform[o + c], l1_thresh.x);
     }
 
     int Bq = eval_deform_basis(tau, orders.z, orders.w, basis);
@@ -1969,6 +2003,9 @@ kernel void deform_backward_adam_kernel(
         for (int c = 0; c < 4; c++)
             adam_update_element(deform[o + c], exp_avg[o + c], exp_avg_sq[o + c],
                                 g[c], steps.y, beta1, beta2, bc2_sqrt, eps);
+        if (l1_thresh.y > 0.0f)
+            for (int c = 0; c < 4; c++)
+                deform[o + c] = soft_threshold(deform[o + c], l1_thresh.y);
     }
 }
 

@@ -153,6 +153,11 @@ MTensor& msplat_forward_radii();
 // v_mu_extra and v_vel are the Phase-3 contributions (flow, rigidity); pass
 // undefined MTensors to leave them out. Everything lands in ONE Adam step —
 // a second step on the same tensor would corrupt the moment estimates.
+//
+// l1 > 0 adds an L1 shrinkage on the trajectory coefficients, applied as a
+// proximal step after Adam (threshold = l1 * step size). The basis starts at
+// tau^1, so every coefficient is pure motion and an exact zero means "this
+// gaussian stands still" — which is what most of a stage is. Set 0 to disable.
 void msplat_deform_backward_adam(
     int num_points, MTensor &v_mean3d, MTensor &v_quat, MTensor &deform,
     MTensor &exp_avg, MTensor &exp_avg_sq,
@@ -160,7 +165,8 @@ void msplat_deform_backward_adam(
     float step_size_means, float step_size_rot,
     float beta1, float beta2, float bc2_sqrt, float eps,
     MTensor &v_mu_extra, MTensor &v_vel,
-    MTensor &v_temporal_w, float step_size_temporal
+    MTensor &v_temporal_w, float step_size_temporal,
+    float l1 = 0.0f
 );
 
 // ── Phase 3: flow splatting ─────────────────────────────────────────────────

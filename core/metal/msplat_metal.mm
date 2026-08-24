@@ -1894,7 +1894,8 @@ void msplat_deform_backward_adam(
     float step_size_means, float step_size_rot,
     float beta1, float beta2, float bc2_sqrt, float eps,
     MTensor &v_mu_extra, MTensor &v_vel,
-    MTensor &v_temporal_w, float step_size_temporal
+    MTensor &v_temporal_w, float step_size_temporal,
+    float l1
 ) {
     MetalContext* ctx = get_global_context();
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
@@ -1906,6 +1907,10 @@ void msplat_deform_backward_adam(
     std::array<float, 2> temporal_cfg = {
         (ord.temporal && v_temporal_w.defined()) ? 1.0f : 0.0f, step_size_temporal};
     std::array<float, 2> has_temporal = {temporal_cfg[0], 0.0f};
+    // Die Schwelle des proximalen Schritts ist lambda * Schrittweite, damit die
+    // Schrumpfung pro Iteration genauso skaliert wie der Adam-Schritt selbst und
+    // ein LR-Schedule sie automatisch mitzieht.
+    std::array<float, 2> l1_thresh = {l1 * step_size_means, l1 * step_size_rot};
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
@@ -1928,6 +1933,7 @@ void msplat_deform_backward_adam(
         MTensor &vtw = has_temporal[0] != 0.0f ? v_temporal_w : v_mean3d;
         ENC_BUF(enc, vtw, 13);
         ENC_STDARR(enc, temporal_cfg, 14);
+        ENC_STDARR(enc, l1_thresh, 15);
         dispatch_per_point(enc, ctx->deform_backward_adam_kernel_cpso, num_points);
         [enc endEncoding];
     });

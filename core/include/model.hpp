@@ -32,6 +32,16 @@ struct DeformConfig {
   // different scale from the trajectory coefficients.
   float tempLr = 0.0f;
 
+  // L1 shrinkage on the trajectory coefficients, as a proximal step after Adam.
+  // The basis starts at tau^1, so every coefficient is pure motion and an exact
+  // zero means "this gaussian stands still". On a stage that is the majority
+  // case: the room does not move, a small part of it does. Without this, all
+  // 3*(nPoly + 2*nFourier) coefficients of a floor gaussian are free to fit
+  // per-frame photometric noise, and the static scene jitters — measured on
+  // rig4 at 18x the temporal variation of the ground truth, carrying two thirds
+  // of the total novel-view error.
+  float l1 = 0.0f;
+
   // Depth supervision and opacity entropy. Independent of the 4D machinery —
   // both work on a purely static model too, which is the point: they constrain
   // geometry, and a sparse rig gets that wrong whether or not it is moving.

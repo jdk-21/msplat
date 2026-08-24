@@ -33,6 +33,7 @@ class TrainingConfig:
     deform_rot_lr: float
     deform_temporal: bool
     deform_temp_lr: float
+    deform_l1: float
     # Flow splatting (Phase 3) — needs <input>/flow/<stem>.flo.
     flow: bool
     flow_weight: float
@@ -83,6 +84,7 @@ class TrainingConfig:
         rigid_k: int = 20,
         deform_temporal: bool = False,
         deform_temp_lr: float = 0.01,
+        deform_l1: float = 0.0,
         depth: bool = False,
         depth_weight: float = 0.5,
         depth_min_coverage: float = 0.5,
